@@ -702,6 +702,12 @@ impl<'a> Lower<'a> {
                     let mut uses_readlane = false;
                     let mut uses_ballot_or_red = false;
                     let mut can_emulate = total > 0;
+                    let mut reject_wave_section = false;
+                    let mut reject_readlane = false;
+                    let mut reject_mask_data = false;
+                    let mut reject_mask_def = false;
+                    let mut reject_lds_div = false;
+                    let mut reject_lds_size = false;
                     let is_mask =
                         |v: Value| x.st.masks.contains_key(&v) || x.st.highs.contains_key(&v);
                     for b in 0..p.blocks.len() {
@@ -709,6 +715,7 @@ impl<'a> Lower<'a> {
                             uses_ballot_or_red = true;
                             if total > 32 && !uniform[b] {
                                 can_emulate = false;
+                                reject_wave_section = true;
                             }
                         }
                         for inst in &p.blocks[b].insts {
@@ -723,6 +730,7 @@ impl<'a> Lower<'a> {
                                 uses_readlane = true;
                                 if total > 32 && !uniform[b] {
                                     can_emulate = false;
+                                    reject_readlane = true;
                                 }
                             }
                             if reads_mask_as_data(x.st, inst) {
@@ -730,6 +738,7 @@ impl<'a> Lower<'a> {
                                 if total > 32 {
                                     if !uniform[b] {
                                         can_emulate = false;
+                                        reject_mask_data = true;
                                     }
                                     for &(_, r) in &inst.reads {
                                         if is_mask(r) {
@@ -739,6 +748,7 @@ impl<'a> Lower<'a> {
                                                 .is_some_and(|&db| !uniform[db])
                                             {
                                                 can_emulate = false;
+                                                reject_mask_def = true;
                                             }
                                         }
                                     }
@@ -752,6 +762,7 @@ impl<'a> Lower<'a> {
                                 && !uniform[b]
                             {
                                 can_emulate = false;
+                                reject_lds_div = true;
                             }
                         }
                     }
@@ -767,6 +778,7 @@ impl<'a> Lower<'a> {
                         .is_none_or(|n| n > 8192)
                     {
                         can_emulate = false;
+                        reject_lds_size = true;
                     }
                     if can_emulate {
                         emulate_wave64 = true;
@@ -778,6 +790,19 @@ impl<'a> Lower<'a> {
                             s.wave_size = Some(32);
                         }
                     } else {
+                        #[cfg(feature = "diagnostics")]
+                        eprintln!(
+                            "[wave64-skip] total={total} lds={title_lds_dwords}+{emu_lds_dwords} sec={reject_wave_section} rl={reject_readlane} md={reject_mask_data} mdef={reject_mask_def} lds_div={reject_lds_div} lds_sz={reject_lds_size}"
+                        );
+                        #[cfg(not(feature = "diagnostics"))]
+                        let _ = (
+                            reject_wave_section,
+                            reject_readlane,
+                            reject_mask_data,
+                            reject_mask_def,
+                            reject_lds_div,
+                            reject_lds_size,
+                        );
                         s.wave_size = Some(wave);
                     }
                 }
@@ -2581,9 +2606,14 @@ impl<'a> Lower<'a> {
             MESH_INDICES => (mesh.max_primitives, 3),
             _ => (mesh.max_primitives, 4 * self.s.prims.len() as u32),
         };
+        if per_group == 0 || record == 0 || dword.saturating_add(vals.len() as u32) > record {
+            return;
+        }
+        let n = self.s.m.i32(per_group);
+        let in_bounds = self.s.m.cmp(self.cur, pred::IULT, slot, n);
+        let at = self.begin_guarded(Some(in_bounds));
         let c = self.cur;
         let g = self.mesh_group_id();
-        let n = self.s.m.i32(per_group);
         let first = self.s.m.bin(c, Bin::Mul, g, n);
         let index = self.s.m.bin(c, Bin::Add, first, slot);
         let rec = self.s.m.i32(record * 4);
@@ -2600,6 +2630,7 @@ impl<'a> Lower<'a> {
         let void = self.s.t.void;
         self.s
             .op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+        self.end_guarded(at, &[]);
     }
 
     fn mesh_out_store(&mut self, out: u8, slot: V, vals: &[V]) {
@@ -7464,22 +7495,32 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let max_v = self.s.mesh.expect("mesh").max_vertices;
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
         // Run as compute, indices are into the vertex buffer of all groups:
         // this group's first vertex is added (a culled triangle stays 0, 0, 0).
         let first = if self.s.mesh_as_compute {
             let g = self.mesh_group_id();
-            let n = self.s.m.i32(self.s.mesh.expect("mesh").max_vertices);
+            let n = self.s.m.i32(max_v);
             Some(self.s.m.bin(c, Bin::Mul, g, n))
         } else {
             None
         };
         let flat = self.mesh_thread();
-        let mut indices = Vec::new();
+        let max_v_i32 = self.s.m.i32(max_v);
+        let mut raw = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let mut i = self.s.m.bin(c, Bin::And, i, mask);
+            let i = self.s.m.bin(c, Bin::And, i, mask);
+            if self.s.mesh_as_compute {
+                let oob = self.s.m.cmp(c, pred::IUGE, i, max_v_i32);
+                culled = self.s.m.bin(c, Bin::Or, culled, oob);
+            }
+            raw.push(i);
+        }
+        let mut indices = Vec::with_capacity(3);
+        for mut i in raw {
             if let Some(first) = first {
                 i = self.s.m.bin(c, Bin::Add, i, first);
             }
