@@ -70,8 +70,21 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// (a capped heap, NVIDIA): doubled from 2^16 to 2^17 so world frames do
+/// not exhaust dynamic CBV/table slots under NVIDIA's 1,000,000 view cap.
+const MIN_DYNAMIC: u32 = 1 << 17;
+
+/// Computes `(mirrored_count, dynamic_count)` when `count + DYNAMIC` fails
+/// (e.g. NVIDIA's [`PORTABLE_VIEWS`] limit of 1,000,000 views).
+fn capped_layout(count: u32) -> (u32, u32) {
+    if count.saturating_add(DYNAMIC) <= PORTABLE_VIEWS {
+        (count, MIN_DYNAMIC)
+    } else if count.saturating_add(MIN_DYNAMIC) <= PORTABLE_VIEWS {
+        (count, PORTABLE_VIEWS - count)
+    } else {
+        (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+    }
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -94,7 +107,8 @@ impl HostHeap {
             }
         };
         // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
+        // every title slot; else use remaining headroom up to PORTABLE_VIEWS
+        // while preserving at least MIN_DYNAMIC dynamic slots.
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
@@ -106,13 +120,20 @@ impl HostHeap {
         } else if let Ok(heap) = make(count + DYNAMIC) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            let (mirrored, extra) = capped_layout(count);
+            match make(mirrored + extra) {
+                Ok(heap) => {
+                    if mirrored < count {
+                        // shortcut: descriptors past the host's limit are left
+                        // out; `draw.rs` mirrors those tables in dynamic slots.
+                        tracing::warn!(
+                            count,
+                            mirrored,
+                            dynamic = extra,
+                            "host view heap capped at {PORTABLE_VIEWS}"
+                        );
+                    }
+                    (heap, mirrored, extra)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -972,5 +993,19 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn capped_layout_preserves_dynamic_headroom() {
+        assert_eq!(capped_layout(100_000), (100_000, MIN_DYNAMIC));
+        assert_eq!(capped_layout(800_000), (800_000, PORTABLE_VIEWS - 800_000));
+        assert_eq!(
+            capped_layout(900_000),
+            (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+        );
+        assert_eq!(
+            capped_layout(1_245_184),
+            (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+        );
     }
 }
