@@ -2433,31 +2433,46 @@ impl Meter {
     }
 }
 
+fn parse_size_env(var: &str) -> Option<(u32, u32)> {
+    let raw = std::env::var(var).ok()?;
+    let s = raw.trim();
+    let pair = if let Some((w, h)) = s.split_once(['x', 'X']) {
+        let w: u32 = w.trim().parse().ok()?;
+        let h: u32 = h.trim().parse().ok()?;
+        (w, h)
+    } else {
+        let w: u32 = s.parse().ok()?;
+        (w, (w * 9 / 16).max(1))
+    };
+    (pair.0 >= 320 && pair.1 >= 180).then_some(pair)
+}
+
 /// Optional presentation resolution cap (`VICTORY_PRESENT_RESOLUTION`, e.g.
-/// `1600x900`, `1280x720`, `1920x1080`, or a width like `1600` / `1280`).
+/// `1600x900`, `1440x810`, `1280x720`, or a width like `1440` / `1280`).
 fn present_resolution_cap() -> Option<(u32, u32)> {
     static CAP: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *CAP.get_or_init(|| {
-        let raw = std::env::var("VICTORY_PRESENT_RESOLUTION").ok()?;
-        let s = raw.trim();
-        let pair = if let Some((w, h)) = s.split_once(['x', 'X']) {
-            let w: u32 = w.trim().parse().ok()?;
-            let h: u32 = h.trim().parse().ok()?;
-            (w, h)
-        } else {
-            let w: u32 = s.parse().ok()?;
-            (w, (w * 9 / 16).max(1))
-        };
-        if pair.0 >= 320 && pair.1 >= 180 {
-            tracing::info!(
-                width = pair.0,
-                height = pair.1,
-                "VICTORY_PRESENT_RESOLUTION: capping presented swapchain resolution"
-            );
-            Some(pair)
-        } else {
-            None
-        }
+        let pair = parse_size_env("VICTORY_PRESENT_RESOLUTION")?;
+        tracing::info!(
+            width = pair.0,
+            height = pair.1,
+            "VICTORY_PRESENT_RESOLUTION: capping presented swapchain resolution"
+        );
+        Some(pair)
+    })
+}
+
+/// Optional physical window size (`VICTORY_WINDOW_SIZE`, e.g. `960x540` or `1024x576`).
+fn window_size_override() -> Option<(u32, u32)> {
+    static SIZE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let pair = parse_size_env("VICTORY_WINDOW_SIZE")?;
+        tracing::info!(
+            width = pair.0,
+            height = pair.1,
+            "VICTORY_WINDOW_SIZE: sizing host window"
+        );
+        Some(pair)
     })
 }
 
@@ -3009,11 +3024,12 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
+        let (win_w, win_h) = window_size_override().unwrap_or((width, height));
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: width as i32,
-            bottom: height as i32,
+            right: win_w as i32,
+            bottom: win_h as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         CreateWindowExW(
