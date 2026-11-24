@@ -208,6 +208,31 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// With `VICTORY_PRESENT_1440P` set: the latest internal world color render
+/// target (`2560x1440` on Series X, or `1600x900`/`1440x810`/`1280x720` on
+/// Series S; formats `f28`/`f29`/`f87`/`f91`) written during the current
+/// frame, substituted as plane 0 at present time when the title's upscaled
+/// output stays zero (#841).
+static LAST_WORLD_TARGET: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+fn present_1440p_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
+}
+
+/// Takes the latest internal world color render target noted this frame, if
+/// `VICTORY_PRESENT_1440P` is enabled.
+pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    if !present_1440p_on() {
+        return None;
+    }
+    LAST_WORLD_TARGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
@@ -215,7 +240,26 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
+        return;
+    }
+    if present_1440p_on()
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        // SAFETY: a live host texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && d.SampleDesc.Count == 1
+            && matches!(
+                (d.Width, d.Height),
+                (2560, 1440) | (1600, 900) | (1440, 810) | (1280, 720)
+            )
+            && matches!(d.Format.0, 28 | 29 | 87 | 91)
+        {
+            *LAST_WORLD_TARGET.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+        }
+    }
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());

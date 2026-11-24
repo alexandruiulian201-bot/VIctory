@@ -318,11 +318,35 @@ extern "system" fn present(
                 resources.push((resource, texture, state));
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let fallback_1440p = crate::capture::take_1440p_target();
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
+            #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+            let mut sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if let Some(ref copy) = fallback_1440p
+                && &copy.texture != resources[0].1
+            {
+                let state = crate::host::legal_state(
+                    &copy.texture,
+                    copy.state.load(Ordering::Relaxed),
+                );
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    // SAFETY: a live host texture.
+                    let d = unsafe { copy.texture.GetDesc() };
+                    tracing::info!(
+                        width = d.Width,
+                        height = d.Height,
+                        format = d.Format.0,
+                        "VICTORY_PRESENT_1440P: presenting internal world target as plane 0"
+                    );
+                });
+                sources[0] = (&copy.texture, state);
+            }
             let shown = host.present(&sources, frame);
             for &(resource, _, state) in &resources {
                 crate::resource::host_transition(resource, state);

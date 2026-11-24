@@ -90,6 +90,40 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// DXIL `ResourceProperties` flags (`DxilResourceProperties.h`).
+const PROPS_UAV: u32 = 0x1000;
+const PROPS_GLOBALLY_COHERENT: u32 = 0x4000;
+
+fn uav_props(uav: bool, glc: bool) -> u32 {
+    if !uav {
+        0
+    } else if glc {
+        PROPS_UAV | PROPS_GLOBALLY_COHERENT
+    } else {
+        PROPS_UAV
+    }
+}
+
+/// Canonical key for a resource-heap descriptor leaf `(param, byte_offset, dynamic)`.
+fn heap_descriptor_key(
+    layout: &[crate::native::RootParam],
+    scalar: &HashMap<Site, Address>,
+    src: &Source,
+) -> Option<(usize, u32, Option<Value>)> {
+    let Source::Loaded { load, first } = src else {
+        return None;
+    };
+    let a = scalar.get(load)?;
+    let rp = layout.get(a.param)?;
+    if rp.root != RootType::ResourceHeap {
+        return None;
+    }
+    Some((
+        a.param,
+        a.offset.wrapping_add(u32::from(*first) * 4),
+        a.dynamic,
+    ))
+}
 /// Mesh output UAV registers (in [`super::shader::MESH_OUT_SPACE`]).
 const MESH_VERTICES: u8 = 0;
 const MESH_INDICES: u8 = 1;
@@ -180,6 +214,9 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Resource-heap descriptors inferred to be UAVs from any store, atomic,
+    /// or `glc` access in the program.
+    heap_uavs: HashSet<(usize, u32, Option<Value>)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -796,6 +833,34 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let mut heap_uavs = HashSet::new();
+        for d in &x.res.descriptors {
+            if d.role != Role::Resource {
+                continue;
+            }
+            let inst = &p.blocks[d.site.0].insts[d.site.1];
+            let name = inst.name();
+            let implies_uav = match &inst.fields {
+                Fields::Buffer { cache, .. } => {
+                    name.contains("store") || name.contains("atomic") || cache.glc
+                }
+                Fields::Image { cache, .. } => {
+                    name.contains("store")
+                        || name.contains("atomic")
+                        || (cache.glc && name.starts_with("image_load"))
+                }
+                Fields::Smem { cache, .. } => cache.glc && name.starts_with("s_buffer_load"),
+                _ => false,
+            };
+            if implies_uav {
+                for leaf in d.source.leaves() {
+                    if let Some(key) = heap_descriptor_key(&x.native.layout, &scalar, leaf) {
+                        heap_uavs.insert(key);
+                    }
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -822,7 +887,8 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
+            heap_uavs,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -3509,8 +3575,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let glc = matches!(inst.fields, Fields::Smem { cache, .. } if cache.glc);
+        let uav = self.is_uav(src);
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) || uav {
+            let h = self.handle(site, src, false, (11 | uav_props(uav, glc), 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -3622,10 +3690,8 @@ impl<'a> Lower<'a> {
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let uav = un.contains("store") || un.contains("atomic") || self.is_uav(&src);
+        let u = uav_props(uav, false);
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -3955,6 +4021,21 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// Whether `src` is a UAV: declared as one in the table metadata, or a
+    /// resource-heap descriptor accessed by a store, atomic, or `glc` load.
+    fn is_uav(&self, src: &Source) -> bool {
+        if self
+            .used_kind(src)
+            .is_some_and(|u| u.kind == ResourceType::Uav)
+        {
+            return true;
+        }
+        src.leaves().into_iter().any(|leaf| {
+            heap_descriptor_key(&self.x.native.layout, &self.scalar, leaf)
+                .is_some_and(|key| self.heap_uavs.contains(&key))
+        })
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -6317,12 +6398,10 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked image")?;
+        let glc = matches!(inst.fields, Fields::Image { cache, .. } if cache.glc);
         let store = name.starts_with("image_store");
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let uav = store || name.starts_with("image_atomic_") || self.is_uav(src);
+        let props = (kind | uav_props(uav, glc), 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
@@ -6369,7 +6448,7 @@ impl<'a> Lower<'a> {
                 Some(v) if cache.glc => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let h = self.handle(site, src, false, (kind | uav_props(true, cache.glc), 0x105))?;
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             let mut args = vec![h];
@@ -6941,8 +7020,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let glc = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+        let uav = store || atomic.is_some() || self.is_uav(src);
+        let u = uav_props(uav, glc);
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
