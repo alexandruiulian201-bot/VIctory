@@ -357,6 +357,10 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        let limit = self.m.i32(if sampler { 2048 } else { 1_000_000 });
+        let zero = self.m.i32(0);
+        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
+        let index = self.m.select(block, in_bounds, index, zero);
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
