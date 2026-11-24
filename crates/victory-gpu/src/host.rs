@@ -2754,7 +2754,31 @@ impl Host {
         format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
-            Some(hwnd) => hwnd,
+            Some(hwnd) => {
+                if let Some((win_w, win_h)) = window_size_override() {
+                    // SAFETY: resizing our own process's title window.
+                    unsafe {
+                        let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
+                        let mut rect = RECT {
+                            left: 0,
+                            top: 0,
+                            right: win_w as i32,
+                            bottom: win_h as i32,
+                        };
+                        let _ = AdjustWindowRect(&mut rect, style, false);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            0,
+                            0,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+                hwnd
+            }
             None => window(width, height)?,
         };
         // SAFETY: plain object creation for our window.

@@ -817,6 +817,7 @@ impl<'a> Lower<'a> {
                     })
                 })
                 .collect();
+            let uniform = uniform_blocks(p, x.st);
             for &b in &order {
                 let mut d = b;
                 let dominated = loop {
@@ -828,7 +829,7 @@ impl<'a> Lower<'a> {
                     }
                     d = idom[d];
                 };
-                if ms.lds_bytes == 0 || dominated {
+                if ms.lds_bytes == 0 || dominated || !uniform[b] {
                     no_barrier.insert(b);
                 }
             }
