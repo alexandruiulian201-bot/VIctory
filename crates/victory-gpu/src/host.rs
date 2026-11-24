@@ -2773,7 +2773,7 @@ impl Host {
                             0,
                             rect.right - rect.left,
                             rect.bottom - rect.top,
-                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
                         );
                     }
                 }
