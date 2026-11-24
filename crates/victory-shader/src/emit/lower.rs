@@ -258,6 +258,14 @@ struct Lower<'a> {
     active_out: HashMap<(usize, usize), V>,
     /// `OneSidedIf` join metadata: `skip_ir -> Vec<(branch_ir, enter_body, active_before)>`.
     one_sided_joins: HashMap<usize, Vec<(usize, V, V)>>,
+    /// `TwoSidedIf` pre-allocated `else_check` DXIL block by branch IR block.
+    two_sided_else_check: HashMap<usize, usize>,
+    /// `TwoSidedIf` redirected edges `(from_ir, join_ir) -> else_check_dxil_blk`.
+    two_sided_redirect: HashMap<(usize, usize), usize>,
+    /// `TwoSidedIf` join metadata by `join_ir`.
+    two_sided_joins: HashMap<usize, Vec<TwoSidedJoin>>,
+    /// `TwoSidedIf` actual DXIL predecessor for `(br_ir, else_b_ir) -> else_check_tail`.
+    two_sided_else_pred: HashMap<(usize, usize), usize>,
     /// `DivergentLoop` back-edge active mask: `(header_ir, latch_ir) -> next_active`.
     loop_freeze: HashMap<(usize, usize), V>,
     /// Current IR block's active lane predicate (`i1`) when uniformizing divergent CF.
@@ -421,11 +429,29 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 /// Per-block thread-group uniformity (`true` when every thread in the group
 /// executes block `b` in lockstep, assuming group entry is uniform).
 #[derive(Debug, Clone, Copy)]
+struct TwoSidedJoin {
+    br: usize,
+    then_b: usize,
+    else_b: usize,
+    enter_else: V,
+    act_before: V,
+    else_check: usize,
+    else_check_tail: usize,
+    br_dxil: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum UniformBranch {
     /// One target is a trivial `End` block (`if (ret_cond) return;`).
     EarlyReturn { stay: usize, ret: usize },
     /// One target is `ipdom[b]` (`if (body_cond) { body } skip`).
     OneSidedIf { body: usize, skip: usize },
+    /// Two disjoint arms reconverging at `join = ipdom[b]`, serialized as `then` then `else`.
+    TwoSidedIf {
+        then_b: usize,
+        else_b: usize,
+        join: usize,
+    },
     /// One target is a loop back-edge (`while (loop_cond) { ... }`).
     DivergentLoop { header: usize, exit: usize },
 }
@@ -769,6 +795,54 @@ fn plan_uniform_branches(
                     body: taken,
                     skip: not_taken,
                 })
+            } else if rpo[taken] > rpo[br]
+                && rpo[not_taken] > rpo[br]
+                && stop < n
+                && taken != stop
+                && not_taken != stop
+                && idom[taken] == br
+                && idom[not_taken] == br
+            {
+                let check_arm = |start: usize| -> bool {
+                    let mut seen = HashSet::new();
+                    let mut stack = vec![start];
+                    seen.insert(start);
+                    while let Some(u) = stack.pop() {
+                        if !ir_dominates(&idom, start, u) {
+                            return false;
+                        }
+                        if matches!(st.exits[u], LaneExit::End | LaneExit::Indirect) {
+                            return false;
+                        }
+                        for s in succs(u).into_iter().flatten() {
+                            if s == stop {
+                                continue;
+                            }
+                            if !ir_dominates(&idom, start, s) {
+                                return false;
+                            }
+                            if seen.insert(s) {
+                                stack.push(s);
+                            }
+                        }
+                    }
+                    true
+                };
+                if check_arm(taken) {
+                    Some(UniformBranch::TwoSidedIf {
+                        then_b: taken,
+                        else_b: not_taken,
+                        join: stop,
+                    })
+                } else if check_arm(not_taken) {
+                    Some(UniformBranch::TwoSidedIf {
+                        then_b: not_taken,
+                        else_b: taken,
+                        join: stop,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -1143,6 +1217,10 @@ impl<'a> Lower<'a> {
             active_in: vec![None; p.blocks.len()],
             active_out: HashMap::new(),
             one_sided_joins: HashMap::new(),
+            two_sided_else_check: HashMap::new(),
+            two_sided_redirect: HashMap::new(),
+            two_sided_joins: HashMap::new(),
+            two_sided_else_pred: HashMap::new(),
             loop_freeze: HashMap::new(),
             lane_active: None,
             title_lds_dwords,
@@ -1557,6 +1635,23 @@ impl<'a> Lower<'a> {
                     let blk = self.block[b].expect("reachable");
                     self.s.m.phi(blk, self.s.t.i1)
                 });
+            }
+            let two_sided: Vec<(usize, usize, usize)> = self
+                .uniform_branches
+                .iter()
+                .filter_map(|(&br, &ub)| match ub {
+                    UniformBranch::TwoSidedIf { then_b, join, .. } => Some((br, then_b, join)),
+                    _ => None,
+                })
+                .collect();
+            for (br, then_b, join) in two_sided {
+                let else_check = self.s.m.new_block();
+                self.two_sided_else_check.insert(br, else_check);
+                for &q in &p.blocks[join].preds {
+                    if self.block[q].is_some() && ir_dominates(&self.idom, then_b, q) {
+                        self.two_sided_redirect.insert((q, join), else_check);
+                    }
+                }
             }
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
@@ -7856,7 +7951,12 @@ impl<'a> Lower<'a> {
                     self.active_out.insert((b, t), act);
                 }
                 self.enter_loop(b, t, self.cur);
-                Term::Br(self.block[t].expect("reachable"))
+                let target = self
+                    .two_sided_redirect
+                    .get(&(b, t))
+                    .copied()
+                    .unwrap_or_else(|| self.block[t].expect("reachable"));
+                Term::Br(target)
             }
             LaneExit::Branch {
                 when,
@@ -7913,7 +8013,7 @@ impl<'a> Lower<'a> {
                                 self.active_out.insert((b, ret), act);
                                 (any_stay, stay, ret)
                             }
-                            UniformBranch::OneSidedIf { body, skip, .. } => {
+                            UniformBranch::OneSidedIf { body, skip } => {
                                 let body_c = cond_for(self, body);
                                 let enter_body = self.s.m.bin(self.cur, Bin::And, act, body_c);
                                 let any_body = self.wg_any_true(enter_body);
@@ -7926,7 +8026,50 @@ impl<'a> Lower<'a> {
                                     .push((b, enter_body, act));
                                 (any_body, body, skip)
                             }
-                            UniformBranch::DivergentLoop { header, exit, .. } => {
+                            UniformBranch::TwoSidedIf {
+                                then_b,
+                                else_b,
+                                join,
+                            } => {
+                                let then_c = cond_for(self, then_b);
+                                let else_c = self.s.m.bin(self.cur, Bin::Xor, then_c, t_bool);
+                                let enter_then = self.s.m.bin(self.cur, Bin::And, act, then_c);
+                                let enter_else = self.s.m.bin(self.cur, Bin::And, act, else_c);
+                                let any_then = self.wg_any_true(enter_then);
+                                let br_dxil = self.cur;
+                                self.tail[b] = Some(br_dxil);
+                                self.active_out.insert((b, then_b), enter_then);
+                                let else_check = self.two_sided_else_check[&b];
+                                let then_target = self.edge(b, then_b);
+                                self.enter_loop(b, then_b, if then_target == self.block[then_b].expect("reachable") { br_dxil } else { then_target });
+                                self.s
+                                    .m
+                                    .terminate(br_dxil, Term::CondBr(any_then, then_target, else_check));
+                                // Emit `else_check`: runs `wg_any_true(enter_else)` and branches to `else_b` or `join`.
+                                self.cur = else_check;
+                                let any_else = self.wg_any_true(enter_else);
+                                let else_check_tail = self.cur;
+                                self.active_out.insert((b, else_b), enter_else);
+                                self.two_sided_else_pred.insert((b, else_b), else_check_tail);
+                                let else_target = self.block[else_b].expect("reachable");
+                                let join_target = self.block[join].expect("reachable");
+                                self.s.m.terminate(
+                                    else_check_tail,
+                                    Term::CondBr(any_else, else_target, join_target),
+                                );
+                                self.two_sided_joins.entry(join).or_default().push(TwoSidedJoin {
+                                    br: b,
+                                    then_b,
+                                    else_b,
+                                    enter_else,
+                                    act_before: act,
+                                    else_check,
+                                    else_check_tail,
+                                    br_dxil,
+                                });
+                                return Ok(());
+                            }
+                            UniformBranch::DivergentLoop { header, exit } => {
                                 let loop_c = cond_for(self, header);
                                 let next_act = self.s.m.bin(self.cur, Bin::And, act, loop_c);
                                 let any_loop = self.wg_any_true(next_act);
@@ -8021,7 +8164,11 @@ impl<'a> Lower<'a> {
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
-        let target = self.block[to].expect("reachable");
+        let target = self
+            .two_sided_redirect
+            .get(&(from, to))
+            .copied()
+            .unwrap_or_else(|| self.block[to].expect("reachable"));
         let preds = self.x.p.blocks[to]
             .preds
             .iter()
@@ -8059,7 +8206,12 @@ impl<'a> Lower<'a> {
             let mut resolved: Vec<(usize, usize, V)> = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let qb = self
+                    .two_sided_else_pred
+                    .get(&(q, b))
+                    .copied()
+                    .or_else(|| self.edges.get(&(q, b)).copied())
+                    .unwrap_or(qb);
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
@@ -8078,8 +8230,43 @@ impl<'a> Lower<'a> {
                 resolved.push((q, qb, x));
             }
             let joins = self.one_sided_joins.get(&b).cloned();
-            let mut incoming = Vec::with_capacity(resolved.len());
+            let ts_joins = self.two_sided_joins.get(&b).cloned();
+            let mut ts_merged: Vec<(TwoSidedJoin, V)> = Vec::new();
+            if let Some(ts_list) = &ts_joins {
+                let zero = if bit {
+                    self.s.m.bool(false)
+                } else {
+                    self.s.m.i32(0)
+                };
+                let ty = if bit { self.s.t.i1 } else { self.s.t.i32 };
+                for &ts in ts_list {
+                    let merged = self.s.m.phi(ts.else_check, ty);
+                    let mut then_inc = vec![(zero, ts.br_dxil)];
+                    for &(q, qb, x) in &resolved {
+                        if ir_dominates(&self.idom, ts.then_b, q) {
+                            then_inc.push((x, qb));
+                        }
+                    }
+                    self.s.m.set_phi(merged, then_inc);
+                    ts_merged.push((ts, merged));
+                }
+            }
+            let mut incoming = Vec::with_capacity(resolved.len() + ts_merged.len());
+            for &(ts, merged) in &ts_merged {
+                incoming.push((merged, ts.else_check_tail));
+            }
             for &(q, qb, mut x) in &resolved {
+                if ts_merged
+                    .iter()
+                    .any(|(ts, _)| ir_dominates(&self.idom, ts.then_b, q))
+                {
+                    continue;
+                }
+                for &(ts, merged) in &ts_merged {
+                    if ir_dominates(&self.idom, ts.else_b, q) {
+                        x = self.s.m.select(qb, ts.enter_else, x, merged);
+                    }
+                }
                 if let Some(joins) = &joins {
                     let mut ordered = joins.clone();
                     ordered.sort_by_key(|&(br, _, _)| std::cmp::Reverse(self.rpo[br]));
@@ -8110,15 +8297,40 @@ impl<'a> Lower<'a> {
                     continue;
                 };
                 let joins = self.one_sided_joins.get(&b);
+                let ts_joins = self.two_sided_joins.get(&b);
                 let mut incoming = Vec::new();
+                if let Some(ts_list) = ts_joins {
+                    for ts in ts_list {
+                        incoming.push((ts.act_before, ts.else_check_tail));
+                    }
+                }
                 for &q in &p.blocks[b].preds {
                     let Some(qb) = self.tail[q] else { continue };
-                    let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                    if let Some(ts_list) = ts_joins
+                        && ts_list
+                            .iter()
+                            .any(|ts| ir_dominates(&self.idom, ts.then_b, q))
+                    {
+                        continue;
+                    }
+                    let qb = self
+                        .two_sided_else_pred
+                        .get(&(q, b))
+                        .copied()
+                        .or_else(|| self.edges.get(&(q, b)).copied())
+                        .unwrap_or(qb);
                     let mut act = self
                         .active_out
                         .get(&(q, b))
                         .copied()
                         .unwrap_or_else(|| self.s.m.bool(true));
+                    if let Some(ts_list) = ts_joins
+                        && let Some(ts) = ts_list
+                            .iter()
+                            .find(|ts| ir_dominates(&self.idom, ts.else_b, q))
+                    {
+                        act = ts.act_before;
+                    }
                     if let Some(joins) = joins {
                         if let Some(&(_, _, act_before)) = joins
                             .iter()
