@@ -423,23 +423,11 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 #[derive(Debug, Clone, Copy)]
 enum UniformBranch {
     /// One target is a trivial `End` block (`if (ret_cond) return;`).
-    EarlyReturn {
-        stay: usize,
-        ret: usize,
-        ret_when_true: bool,
-    },
+    EarlyReturn { stay: usize, ret: usize },
     /// One target is `ipdom[b]` (`if (body_cond) { body } skip`).
-    OneSidedIf {
-        body: usize,
-        skip: usize,
-        skip_when_true: bool,
-    },
+    OneSidedIf { body: usize, skip: usize },
     /// One target is a loop back-edge (`while (loop_cond) { ... }`).
-    DivergentLoop {
-        header: usize,
-        exit: usize,
-        back_when_true: bool,
-    },
+    DivergentLoop { header: usize, exit: usize },
 }
 
 fn ir_dominates(idom: &[usize], h: usize, mut u: usize) -> bool {
@@ -755,37 +743,31 @@ fn plan_uniform_branches(
                 Some(UniformBranch::EarlyReturn {
                     stay: not_taken,
                     ret: taken,
-                    ret_when_true: true,
                 })
             } else if is_trivial_end(not_taken) && !is_trivial_end(taken) && rpo[taken] > rpo[br] {
                 Some(UniformBranch::EarlyReturn {
                     stay: taken,
                     ret: not_taken,
-                    ret_when_true: false,
                 })
             } else if rpo[taken] <= rpo[br] && rpo[not_taken] > rpo[br] && idom[taken] != usize::MAX && idom[taken] != taken {
                 Some(UniformBranch::DivergentLoop {
                     header: taken,
                     exit: not_taken,
-                    back_when_true: true,
                 })
             } else if rpo[not_taken] <= rpo[br] && rpo[taken] > rpo[br] && idom[not_taken] != usize::MAX && idom[not_taken] != not_taken {
                 Some(UniformBranch::DivergentLoop {
                     header: not_taken,
                     exit: taken,
-                    back_when_true: false,
                 })
             } else if rpo[taken] > rpo[br] && rpo[not_taken] > rpo[br] && taken == ipdom[br] && idom[not_taken] == br {
                 Some(UniformBranch::OneSidedIf {
                     body: not_taken,
                     skip: taken,
-                    skip_when_true: true,
                 })
             } else if rpo[taken] > rpo[br] && rpo[not_taken] > rpo[br] && not_taken == ipdom[br] && idom[taken] == br {
                 Some(UniformBranch::OneSidedIf {
                     body: taken,
                     skip: not_taken,
-                    skip_when_true: false,
                 })
             } else {
                 None
@@ -1012,7 +994,7 @@ impl<'a> Lower<'a> {
                             + emu_lds_dwords
                             + u32::from(emu_wg_slot.is_some());
                         sync_lds = one_wave && title_lds_dwords > 0 && total > 32;
-                        if console_lanes {
+                        if console_lanes || emu_wg_slot.is_some() {
                             s.wave_size = Some(32);
                         }
                     } else {
@@ -2702,7 +2684,7 @@ impl<'a> Lower<'a> {
             118,
             &[flat],
         );
-        let wave = self.s.wave_size.expect("set with console lanes");
+        let wave = self.s.wave_size.unwrap_or(32);
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
