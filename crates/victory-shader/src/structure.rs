@@ -98,7 +98,8 @@ impl Hasher for Fx {
 }
 
 const TERMINAL: u32 = u32::MAX;
-const MAX_NODES: usize = 1 << 21;
+const MAX_NODES: usize = 1 << 19;
+const MAX_MEMO: usize = 1 << 18;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 
@@ -158,6 +159,9 @@ impl Bools {
     }
 
     fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if lo == hi {
             return lo;
         }
@@ -184,6 +188,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -202,6 +209,12 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
+        if self.overflow {
+            return Bool::FALSE;
+        }
+        if self.memo.len() >= MAX_MEMO {
+            self.memo.clear();
+        }
         self.memo.insert((f, g, h), r);
         r
     }
@@ -1230,5 +1243,16 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn overflow_short_circuits_ite_and_bounds_memo() {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Uniform(ir::Value(0)), 0);
+        let y = b.atom(Atom::Uniform(ir::Value(1)), 0);
+        b.overflow = true;
+        let memo_before = b.memo.len();
+        assert_eq!(b.ite(x, y, Bool::FALSE), Bool::FALSE);
+        assert_eq!(b.memo.len(), memo_before);
     }
 }
