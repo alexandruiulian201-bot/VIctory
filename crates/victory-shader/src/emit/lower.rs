@@ -246,6 +246,22 @@ struct Lower<'a> {
     emu_total: u32,
     /// Dword base offset of the emulation scratchpad inside TGSM (`lds`).
     emu_lds_base: u32,
+    /// Optional TGSM dword for workgroup-uniform branch reduction (`wg_any_true`).
+    emu_wg_slot: Option<u32>,
+    /// Divergent branches converted to workgroup-uniform branches with `lane_active` predication.
+    uniform_branches: HashMap<usize, UniformBranch>,
+    /// Immediate dominators of IR blocks (for `uniform_branches` join restoration).
+    idom: Vec<usize>,
+    /// Per-IR-block active lane predicate (`i1`) when `uniform_branches` is non-empty.
+    active_in: Vec<Option<V>>,
+    /// Per-edge outgoing active lane predicate (`(from_ir, to_ir) -> i1`).
+    active_out: HashMap<(usize, usize), V>,
+    /// `OneSidedIf` join metadata: `skip_ir -> Vec<(branch_ir, enter_body, active_before)>`.
+    one_sided_joins: HashMap<usize, Vec<(usize, V, V)>>,
+    /// `DivergentLoop` back-edge active mask: `(header_ir, latch_ir) -> next_active`.
+    loop_freeze: HashMap<(usize, usize), V>,
+    /// Current IR block's active lane predicate (`i1`) when uniformizing divergent CF.
+    lane_active: Option<V>,
     /// Title-allocated TGSM size in dwords (excluding emulation scratchpad).
     title_lds_dwords: u32,
     /// Compute (emulated wave64) or mesh: the thread index in the group
@@ -404,10 +420,53 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 
 /// Per-block thread-group uniformity (`true` when every thread in the group
 /// executes block `b` in lockstep, assuming group entry is uniform).
+#[derive(Debug, Clone, Copy)]
+enum UniformBranch {
+    /// One target is a trivial `End` block (`if (ret_cond) return;`).
+    EarlyReturn {
+        stay: usize,
+        ret: usize,
+        ret_when_true: bool,
+    },
+    /// One target is `ipdom[b]` (`if (body_cond) { body } skip`).
+    OneSidedIf {
+        body: usize,
+        skip: usize,
+        skip_when_true: bool,
+    },
+    /// One target is a loop back-edge (`while (loop_cond) { ... }`).
+    DivergentLoop {
+        header: usize,
+        exit: usize,
+        back_when_true: bool,
+    },
+}
+
+fn ir_dominates(idom: &[usize], h: usize, mut u: usize) -> bool {
+    while u != usize::MAX {
+        if u == h {
+            return true;
+        }
+        if idom[u] == u {
+            break;
+        }
+        u = idom[u];
+    }
+    false
+}
+
 fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+    uniform_blocks_with(p, st, &HashSet::new()).0
+}
+
+fn uniform_blocks_with(
+    p: &Program,
+    st: &Structured,
+    ignored_divergent: &HashSet<usize>,
+) -> (Vec<bool>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
     let n = p.blocks.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut index = vec![usize::MAX; n];
@@ -508,13 +567,16 @@ fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
         }
     }
 
-    let is_divergent_branch = |b: usize| match st.exits[b] {
-        LaneExit::Branch { when, .. } => st
-            .bools
-            .support(when)
-            .iter()
-            .any(|a| !matches!(a, Atom::Uniform(_))),
-        _ => false,
+    let is_divergent_branch = |b: usize| {
+        !ignored_divergent.contains(&b)
+            && match st.exits[b] {
+                LaneExit::Branch { when, .. } => st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .any(|a| !matches!(a, Atom::Uniform(_))),
+                _ => false,
+            }
     };
 
     let mut uniform: Vec<bool> = (0..n)
@@ -549,22 +611,10 @@ fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
     // Natural loops whose header/latch becomes non-uniform or that have a
     // divergent exit branch lose lockstep across the whole loop body.
     let idom = crate::ir::idoms(&p.blocks, &order, &index);
-    let dominates = |h: usize, mut u: usize| -> bool {
-        while u != usize::MAX {
-            if u == h {
-                return true;
-            }
-            if idom[u] == u {
-                break;
-            }
-            u = idom[u];
-        }
-        false
-    };
     let mut loops: Vec<(usize, HashSet<usize>)> = Vec::new();
     for &u in &order {
         for h in succs(u).into_iter().flatten() {
-            if !dominates(h, u) {
+            if !ir_dominates(&idom, h, u) {
                 continue;
             }
             let mut body = HashSet::new();
@@ -606,7 +656,151 @@ fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
             break;
         }
     }
-    uniform
+    (uniform, idom, ipdom, order, index)
+}
+
+/// Plans workgroup-uniform predication for divergent branches that surround
+/// wave64-emulated operations (`need_uniform`). Returns `Some(plan)` if every
+/// required divergent branch can be converted to `EarlyReturn`, `OneSidedIf`,
+/// or `DivergentLoop` so all needed blocks (and the uniformized branches
+/// themselves) run in workgroup-uniform control flow.
+fn plan_uniform_branches(
+    p: &Program,
+    st: &Structured,
+    need_uniform: &[bool],
+) -> Option<(HashMap<usize, UniformBranch>, Vec<usize>)> {
+    let n = p.blocks.len();
+    let mut ignored = HashSet::new();
+    let mut plan: HashMap<usize, UniformBranch> = HashMap::new();
+    let is_trivial_end = |t: usize| {
+        st.exits[t] == LaneExit::End
+            && p.blocks[t].phis.is_empty()
+            && p.blocks[t].insts.iter().all(|i| i.name() == "s_endpgm")
+    };
+    let succs = |b: usize| -> [Option<usize>; 2] {
+        match st.exits[b] {
+            LaneExit::End | LaneExit::Indirect => [None, None],
+            LaneExit::Jump(t) => [Some(t), None],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => [Some(taken), Some(not_taken)],
+        }
+    };
+    loop {
+        let (uniform, idom, ipdom, order, rpo) = uniform_blocks_with(p, st, &ignored);
+        let all_ok = (0..n).all(|b| (!need_uniform[b] && !plan.contains_key(&b)) || uniform[b]);
+        if all_ok {
+            return Some((plan, idom));
+        }
+        // Find divergent branches whose region (or loop) affects any still-non-uniform needed block.
+        let mut added = false;
+        for &br in &order {
+            if ignored.contains(&br) {
+                continue;
+            }
+            let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = st.exits[br]
+            else {
+                continue;
+            };
+            let is_div = st
+                .bools
+                .support(when)
+                .iter()
+                .any(|a| !matches!(a, Atom::Uniform(_)));
+            if !is_div {
+                continue;
+            }
+            // Check whether ignoring `br` makes progress or `br`'s region touches a needed non-uniform block.
+            let stop = ipdom[br];
+            let mut touches = false;
+            let mut work = Vec::new();
+            let mut visited = vec![false; n];
+            for s in [taken, not_taken] {
+                if s != stop && !visited[s] {
+                    visited[s] = true;
+                    work.push(s);
+                }
+            }
+            while let Some(u) = work.pop() {
+                if (need_uniform[u] || plan.contains_key(&u)) && !uniform[u] {
+                    touches = true;
+                    break;
+                }
+                for s in succs(u).into_iter().flatten() {
+                    if s != stop && !visited[s] {
+                        visited[s] = true;
+                        work.push(s);
+                    }
+                }
+            }
+            // Also check if `br` is a divergent exit of a loop containing a needed non-uniform block.
+            if !touches {
+                for &u in &order {
+                    if (need_uniform[u] || plan.contains_key(&u)) && !uniform[u] {
+                        if ir_dominates(&idom, u, br) || ir_dominates(&idom, br, u) {
+                            touches = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !touches {
+                continue;
+            }
+            let kind = if is_trivial_end(taken) && !is_trivial_end(not_taken) && rpo[not_taken] > rpo[br] {
+                Some(UniformBranch::EarlyReturn {
+                    stay: not_taken,
+                    ret: taken,
+                    ret_when_true: true,
+                })
+            } else if is_trivial_end(not_taken) && !is_trivial_end(taken) && rpo[taken] > rpo[br] {
+                Some(UniformBranch::EarlyReturn {
+                    stay: taken,
+                    ret: not_taken,
+                    ret_when_true: false,
+                })
+            } else if rpo[taken] <= rpo[br] && rpo[not_taken] > rpo[br] && idom[taken] != usize::MAX && idom[taken] != taken {
+                Some(UniformBranch::DivergentLoop {
+                    header: taken,
+                    exit: not_taken,
+                    back_when_true: true,
+                })
+            } else if rpo[not_taken] <= rpo[br] && rpo[taken] > rpo[br] && idom[not_taken] != usize::MAX && idom[not_taken] != not_taken {
+                Some(UniformBranch::DivergentLoop {
+                    header: not_taken,
+                    exit: taken,
+                    back_when_true: false,
+                })
+            } else if rpo[taken] > rpo[br] && rpo[not_taken] > rpo[br] && taken == ipdom[br] && idom[not_taken] == br {
+                Some(UniformBranch::OneSidedIf {
+                    body: not_taken,
+                    skip: taken,
+                    skip_when_true: true,
+                })
+            } else if rpo[taken] > rpo[br] && rpo[not_taken] > rpo[br] && not_taken == ipdom[br] && idom[taken] == br {
+                Some(UniformBranch::OneSidedIf {
+                    body: taken,
+                    skip: not_taken,
+                    skip_when_true: false,
+                })
+            } else {
+                None
+            };
+            let Some(kind) = kind else {
+                return None;
+            };
+            plan.insert(br, kind);
+            ignored.insert(br);
+            added = true;
+        }
+        if !added {
+            return None;
+        }
+    }
 }
 
 impl<'a> Lower<'a> {
@@ -643,6 +837,9 @@ impl<'a> Lower<'a> {
         let mut emulate_wave64 = false;
         let mut emu_total = 0u32;
         let mut emu_lds_base = 0u32;
+        let mut emu_wg_slot = None;
+        let mut uniform_branches = HashMap::new();
+        let mut idom = Vec::new();
         let mut title_lds_dwords = 0u32;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -702,6 +899,7 @@ impl<'a> Lower<'a> {
                     let mut uses_readlane = false;
                     let mut uses_ballot_or_red = false;
                     let mut can_emulate = total > 0;
+                    let mut need_uniform = vec![false; p.blocks.len()];
                     let mut reject_wave_section = false;
                     let mut reject_readlane = false;
                     let mut reject_mask_data = false;
@@ -713,9 +911,12 @@ impl<'a> Lower<'a> {
                     for b in 0..p.blocks.len() {
                         if !super::wave::sections(p, b).is_empty() {
                             uses_ballot_or_red = true;
-                            if total > 32 && !uniform[b] {
-                                can_emulate = false;
-                                reject_wave_section = true;
+                            if total > 32 {
+                                need_uniform[b] = true;
+                                if !uniform[b] {
+                                    can_emulate = false;
+                                    reject_wave_section = true;
+                                }
                             }
                         }
                         for inst in &p.blocks[b].insts {
@@ -728,14 +929,18 @@ impl<'a> Lower<'a> {
                                         .is_some_and(|w| x.res.waterfall.reads.contains(&w.1)))
                             {
                                 uses_readlane = true;
-                                if total > 32 && !uniform[b] {
-                                    can_emulate = false;
-                                    reject_readlane = true;
+                                if total > 32 {
+                                    need_uniform[b] = true;
+                                    if !uniform[b] {
+                                        can_emulate = false;
+                                        reject_readlane = true;
+                                    }
                                 }
                             }
                             if reads_mask_as_data(x.st, inst) {
                                 uses_ballot_or_red = true;
                                 if total > 32 {
+                                    need_uniform[b] = true;
                                     if !uniform[b] {
                                         can_emulate = false;
                                         reject_mask_data = true;
@@ -743,12 +948,12 @@ impl<'a> Lower<'a> {
                                     for &(_, r) in &inst.reads {
                                         if is_mask(r) {
                                             let lo = x.st.highs.get(&r).copied().unwrap_or(r);
-                                            if def_block
-                                                .get(&lo)
-                                                .is_some_and(|&db| !uniform[db])
-                                            {
-                                                can_emulate = false;
-                                                reject_mask_def = true;
+                                            if let Some(&db) = def_block.get(&lo) {
+                                                need_uniform[db] = true;
+                                                if !uniform[db] {
+                                                    can_emulate = false;
+                                                    reject_mask_def = true;
+                                                }
                                             }
                                         }
                                     }
@@ -759,10 +964,12 @@ impl<'a> Lower<'a> {
                                 && total > 32
                                 && matches!(inst.fields, Fields::Ds { .. })
                                 && n != "ds_swizzle_b32"
-                                && !uniform[b]
                             {
-                                can_emulate = false;
-                                reject_lds_div = true;
+                                need_uniform[b] = true;
+                                if !uniform[b] {
+                                    can_emulate = false;
+                                    reject_lds_div = true;
+                                }
                             }
                         }
                     }
@@ -780,11 +987,30 @@ impl<'a> Lower<'a> {
                         can_emulate = false;
                         reject_lds_size = true;
                     }
+                    if !can_emulate
+                        && !reject_lds_size
+                        && total > 32
+                        && title_lds_dwords
+                            .checked_add(emu_lds_dwords)
+                            .and_then(|n| n.checked_add(1))
+                            .is_some_and(|n| n <= 8192)
+                        && let Some((plan, plan_idom)) =
+                            plan_uniform_branches(p, x.st, &need_uniform)
+                    {
+                        can_emulate = true;
+                        if !plan.is_empty() {
+                            emu_wg_slot = Some(title_lds_dwords + emu_lds_dwords);
+                            uniform_branches = plan;
+                            idom = plan_idom;
+                        }
+                    }
                     if can_emulate {
                         emulate_wave64 = true;
                         emu_total = total;
                         emu_lds_base = title_lds_dwords;
-                        s.lds_dwords = title_lds_dwords + emu_lds_dwords;
+                        s.lds_dwords = title_lds_dwords
+                            + emu_lds_dwords
+                            + u32::from(emu_wg_slot.is_some());
                         sync_lds = one_wave && title_lds_dwords > 0 && total > 32;
                         if console_lanes {
                             s.wave_size = Some(32);
@@ -929,6 +1155,14 @@ impl<'a> Lower<'a> {
             emulate_wave64,
             emu_total,
             emu_lds_base,
+            emu_wg_slot,
+            uniform_branches,
+            idom,
+            active_in: vec![None; p.blocks.len()],
+            active_out: HashMap::new(),
+            one_sided_joins: HashMap::new(),
+            loop_freeze: HashMap::new(),
+            lane_active: None,
             title_lds_dwords,
             flat: None,
             no_barrier,
@@ -1333,6 +1567,16 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        if !self.uniform_branches.is_empty() {
+            for (n, &b) in order.iter().enumerate() {
+                self.active_in[b] = Some(if n == 0 {
+                    self.s.m.bool(true)
+                } else {
+                    let blk = self.block[b].expect("reachable");
+                    self.s.m.phi(blk, self.s.t.i1)
+                });
+            }
+        }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -1355,6 +1599,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.lane_active = self.active_in[b];
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -1693,18 +1938,22 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
+                let def_ir = self.def_block.get(&lo).copied();
+                let at = match def_ir {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(b) if b == self.cur_ir => self.cur,
+                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let mut bit = bit?;
+                if let Some(act) = def_ir.and_then(|b| self.active_in[b]) {
+                    bit = self.s.m.bin(at, Bin::And, bit, act);
+                }
                 let xy = if self.emulate_wave64 {
                     self.emulate_ballot(at, bit)
                 } else {
@@ -2228,10 +2477,16 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let base = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(match (base, self.lane_active) {
+            (Some(g), Some(act)) => Some(self.s.m.bin(self.cur, Bin::And, g, act)),
+            (Some(g), None) => Some(g),
+            (None, Some(act)) => Some(act),
+            (None, None) => None,
+        })
     }
 
     // ---- results ----
@@ -2534,6 +2789,42 @@ impl<'a> Lower<'a> {
         } else {
             self.emu_exchange_pair(at, h, z)
         }
+    }
+
+    /// Workgroup-wide `any(cond)` via 1 TGSM dword (`emu_wg_slot`) and
+    /// `waveActiveBallot`, guaranteeing uniform control flow across all wave32
+    /// subwaves in the workgroup. Advances `self.cur`.
+    fn wg_any_true(&mut self, cond: V) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let slot = self.emu_wg_slot.expect("emu_wg_slot");
+        let lds = self.s.lds();
+        let idx = self.s.m.i32(slot);
+        let z = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let flat = self.console_flat();
+        let is0 = self.s.m.cmp(self.cur, pred::EQ, flat, z);
+        let g0 = self.begin_guarded(Some(is0));
+        let ptr0 = self.s.m.element(self.cur, lds, idx);
+        self.s.m.store(self.cur, ptr0, z);
+        self.end_guarded(g0, &[]);
+        self.emit_lds_barrier();
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let b = self
+            .s
+            .op(self.cur, "waveActiveBallot", Attr::NoUnwind, four, 116, &[cond]);
+        let mask = self.s.m.extract(self.cur, b, 0);
+        let w_any = self.s.m.cmp(self.cur, pred::NE, mask, z);
+        let g1 = self.begin_guarded(Some(w_any));
+        let ptr1 = self.s.m.element(self.cur, lds, idx);
+        self.s.m.store(self.cur, ptr1, one);
+        self.end_guarded(g1, &[]);
+        self.emit_lds_barrier();
+        let ptr2 = self.s.m.element(self.cur, lds, idx);
+        let val = self.s.m.load(self.cur, ptr2);
+        let res = self.s.m.cmp(self.cur, pred::NE, val, z);
+        self.emit_lds_barrier();
+        res
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -7571,11 +7862,17 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
+                if let Some(act) = self.active_in[b] {
+                    self.active_out.insert((b, t), act);
+                }
                 let ok = self.count_iteration(t, pred::IULT);
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
+                if let Some(act) = self.active_in[b] {
+                    self.active_out.insert((b, t), act);
+                }
                 self.enter_loop(b, t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
             }
@@ -7613,6 +7910,59 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                let (cond, taken, not_taken) =
+                    if let (Some(&ub), Some(act)) = (self.uniform_branches.get(&b), self.active_in[b])
+                    {
+                        let t_bool = self.s.m.bool(true);
+                        let cond_for = |this: &mut Self, target: usize| {
+                            if target == taken {
+                                cond
+                            } else {
+                                this.s.m.bin(this.cur, Bin::Xor, cond, t_bool)
+                            }
+                        };
+                        match ub {
+                            UniformBranch::EarlyReturn { stay, ret, .. } => {
+                                let stay_c = cond_for(self, stay);
+                                let next_act = self.s.m.bin(self.cur, Bin::And, act, stay_c);
+                                let any_stay = self.wg_any_true(next_act);
+                                self.tail[b] = Some(self.cur);
+                                self.active_out.insert((b, stay), next_act);
+                                self.active_out.insert((b, ret), act);
+                                (any_stay, stay, ret)
+                            }
+                            UniformBranch::OneSidedIf { body, skip, .. } => {
+                                let body_c = cond_for(self, body);
+                                let enter_body = self.s.m.bin(self.cur, Bin::And, act, body_c);
+                                let any_body = self.wg_any_true(enter_body);
+                                self.tail[b] = Some(self.cur);
+                                self.active_out.insert((b, body), enter_body);
+                                self.active_out.insert((b, skip), act);
+                                self.one_sided_joins
+                                    .entry(skip)
+                                    .or_default()
+                                    .push((b, enter_body, act));
+                                (any_body, body, skip)
+                            }
+                            UniformBranch::DivergentLoop { header, exit, .. } => {
+                                let loop_c = cond_for(self, header);
+                                let next_act = self.s.m.bin(self.cur, Bin::And, act, loop_c);
+                                let any_loop = self.wg_any_true(next_act);
+                                self.tail[b] = Some(self.cur);
+                                self.active_out.insert((b, header), next_act);
+                                let pre_act = self.active_in[self.idom[header]].unwrap_or(act);
+                                self.active_out.insert((b, exit), pre_act);
+                                self.loop_freeze.insert((header, b), next_act);
+                                (any_loop, header, exit)
+                            }
+                        }
+                    } else {
+                        if let Some(act) = self.active_in[b] {
+                            self.active_out.insert((b, taken), act);
+                            self.active_out.insert((b, not_taken), act);
+                        }
+                        (cond, taken, not_taken)
+                    };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -7724,7 +8074,7 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
-            let mut incoming = Vec::new();
+            let mut resolved: Vec<(usize, usize, V)> = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
@@ -7743,9 +8093,63 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
+                resolved.push((q, qb, x));
+            }
+            let joins = self.one_sided_joins.get(&b).cloned();
+            let mut incoming = Vec::with_capacity(resolved.len());
+            for &(q, qb, mut x) in &resolved {
+                if let Some(joins) = &joins {
+                    let mut ordered = joins.clone();
+                    ordered.sort_by_key(|&(br, _, _)| std::cmp::Reverse(self.rpo[br]));
+                    for (br, enter_body, _) in ordered {
+                        if q != br
+                            && ir_dominates(&self.idom, br, q)
+                            && let Some(&(_, _, v_before)) =
+                                resolved.iter().find(|&&(pq, _, _)| pq == br)
+                        {
+                            x = self.s.m.select(qb, enter_body, x, v_before);
+                        }
+                    }
+                }
+                if let Some(&next_act) = self.loop_freeze.get(&(b, q)) {
+                    x = self.s.m.select(qb, next_act, x, v);
+                }
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        if !self.uniform_branches.is_empty() {
+            let entry_ir = crate::ir::reverse_postorder(&p.blocks)[0];
+            for b in 0..p.blocks.len() {
+                if b == entry_ir {
+                    continue;
+                }
+                let Some(ap) = self.active_in[b] else {
+                    continue;
+                };
+                let joins = self.one_sided_joins.get(&b);
+                let mut incoming = Vec::new();
+                for &q in &p.blocks[b].preds {
+                    let Some(qb) = self.tail[q] else { continue };
+                    let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                    let mut act = self
+                        .active_out
+                        .get(&(q, b))
+                        .copied()
+                        .unwrap_or_else(|| self.s.m.bool(true));
+                    if let Some(joins) = joins {
+                        if let Some(&(_, _, act_before)) = joins
+                            .iter()
+                            .filter(|&&(br, _, _)| q != br && ir_dominates(&self.idom, br, q))
+                            .min_by_key(|&&(br, _, _)| self.rpo[br])
+                        {
+                            act = act_before;
+                        }
+                    }
+                    incoming.push((act, qb));
+                }
+                self.s.m.set_phi(ap, incoming);
+            }
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
