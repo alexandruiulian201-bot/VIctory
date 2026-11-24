@@ -455,17 +455,26 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        self.bind_as(list, p, &p.pso, &p.stages, compute, compute)
+        // Mesh fallback runs the mesh stage in its own compute root signature;
+        // the graphics draw binds only the pixel stage (`stages[1..]`) onto `p.root`.
+        let stages = if !compute && p.fallback.is_some() {
+            &p.stages[1..]
+        } else {
+            &p.stages[..]
+        };
+        self.bind_as(list, p, &p.root, &p.pso, stages, compute, compute)
     }
 
-    /// [`State::bind`] of `stages` with `pso`, reading the title's compute
-    /// (`roots`) or graphics root arguments and setting them on the host's
+    /// [`State::bind`] of `stages` with `root_sig` and `pso`, reading the title's
+    /// compute (`roots`) or graphics root arguments and setting them on the host's
     /// compute (`compute`) or graphics bindings: a mesh program run as
     /// compute reads the graphics arguments into the compute bindings.
+    #[allow(clippy::too_many_arguments)]
     fn bind_as(
         &mut self,
         list: &HostList,
         p: &HostPipeline,
+        root_sig: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         stages: &[crate::pipeline::host::Stage],
         roots: bool,
@@ -488,17 +497,18 @@ impl State {
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
-        let root = p.root.as_raw() as usize;
+        let root = root_sig.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
-                    l.SetComputeRootSignature(&p.root);
+                    l.SetComputeRootSignature(root_sig);
                 } else {
-                    l.SetGraphicsRootSignature(&p.root);
+                    l.SetGraphicsRootSignature(root_sig);
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            list.keep(root_sig);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -509,7 +519,7 @@ impl State {
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(pso);
-            list.keep(&p.root);
+            list.keep(root_sig);
         }
         for stage in stages {
             let t = stage.translated();
@@ -664,28 +674,21 @@ impl State {
         };
         // (At least a little past `u2`'s start, so its address is in the
         // region even when the program has no per-primitive outputs.)
-        let Some(region) = list.mesh_scratch(at_prims + prims.max(16), ScratchPool::Data) else {
+        let Some(buffer) = list.mesh_scratch(at_prims + prims.max(16), ScratchPool::Data) else {
             return false;
         };
-        let buffer = &region.buffer;
-        list.keep(buffer);
+        let buffer = &buffer;
         let l = &list.list;
         let (uav, read) = (
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER,
         );
-        // The chunk's first use in the list: out of COMMON at once, so its
-        // state is UNORDERED_ACCESS whatever happens below.
-        if region.first {
-            // SAFETY: an open list and a live buffer.
-            unsafe { l.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, uav)]) };
-        }
         // The mesh stage, with the title's graphics arguments, as compute.
-        if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+        if !self.bind_as(list, p, &f.root, &f.compute, &p.stages[..1], false, true) {
             return false;
         }
         // SAFETY: the buffer lives until the list is reset.
-        let base = unsafe { buffer.GetGPUVirtualAddress() } + region.offset;
+        let base = unsafe { buffer.GetGPUVirtualAddress() };
         // SAFETY: an open list with the compute pass bound.
         unsafe {
             for (param, at) in f.outputs.into_iter().zip([0, at_indices, at_prims]) {
@@ -768,14 +771,12 @@ impl State {
         ) else {
             return false;
         };
-        list.keep(&data.buffer);
-        list.keep(&commands.buffer);
         let l = &list.list;
         // SAFETY: an open list; the buffers live until the list is reset.
         let (base, commands_gpu) = unsafe {
             (
-                data.buffer.GetGPUVirtualAddress() + data.offset,
-                commands.buffer.GetGPUVirtualAddress() + commands.offset,
+                data.GetGPUVirtualAddress(),
+                commands.GetGPUVirtualAddress(),
             )
         };
         let plan = crate::mesh_indirect::plan(
@@ -788,23 +789,8 @@ impl State {
         );
         let read =
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        let (common, uav, argument) = (
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        );
-        // The chunks rest in UNORDERED_ACCESS (out of COMMON on their first
-        // use in the list). The pass reads the records the clamp just wrote.
-        let (data_buffer, commands_buffer) = (&data.buffer, &commands.buffer);
-        let first: Vec<_> = [&data, &commands]
-            .into_iter()
-            .filter(|r| r.first)
-            .map(|r| transition(&r.buffer, common, uav))
-            .collect();
-        if !first.is_empty() {
-            // SAFETY: an open list and live buffers.
-            unsafe { l.ResourceBarrier(&first) };
-        }
+        let (uav, argument) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        let (data_buffer, commands_buffer) = (&data, &commands);
         crate::mesh_indirect::record(l, convert, &plan, args, count, commands_gpu);
         // SAFETY: an open list and a live buffer.
         unsafe { l.ResourceBarrier(&[transition(commands_buffer, uav, argument)]) };
@@ -812,7 +798,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let mut drawn = false;
-        if self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+        if self.bind_as(list, p, &f.root, &f.compute, &p.stages[..1], false, true) {
             // SAFETY: an open list with the compute pass bound and the
             // commands in INDIRECT_ARGUMENT.
             unsafe {
@@ -822,7 +808,7 @@ impl State {
                     &signatures.compute,
                     records,
                     commands_buffer,
-                    commands.offset,
+                    0,
                     None,
                     0,
                 );
@@ -854,7 +840,7 @@ impl State {
                         &signatures.draw,
                         records,
                         commands_buffer,
-                        commands.offset + draws,
+                        draws,
                         None,
                         0,
                     );

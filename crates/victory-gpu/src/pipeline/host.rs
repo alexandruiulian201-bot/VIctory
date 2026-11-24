@@ -268,11 +268,16 @@ impl Stage {
 /// what it wrote.
 pub(crate) struct MeshFallback {
     pub(crate) compute: ID3D12PipelineState,
+    /// Compute-pass root signature (mesh stage + `u0`-`u2` in `MESH_OUT_SPACE`),
+    /// kept separate from `HostPipeline::root` (pixel stage + `t0`-`t2`) so
+    /// `VISIBILITY_ALL` compute bindings never collide with `VISIBILITY_PIXEL`
+    /// user data, root views, or static samplers in the same register spaces.
+    pub(crate) root: ID3D12RootSignature,
     pub(crate) layout: victory_shader::emit::MeshLayout,
-    /// Root parameters of `u0`, `u1` and `u2` in `MESH_OUT_SPACE`.
+    /// Root parameters of `u0`, `u1` and `u2` in `MESH_OUT_SPACE` (in `root`).
     pub(crate) outputs: [u32; 3],
     /// Root parameters of `t0`, `t1` and `t2` in `MESH_OUT_SPACE` (the same
-    /// buffers, for the vertex shader).
+    /// buffers, for the vertex shader, in `HostPipeline::root`).
     pub(crate) inputs: [u32; 3],
     /// Drawn unindexed, three vertices per primitive (the program has
     /// per-primitive outputs); else indexed by `u1`.
@@ -376,11 +381,13 @@ impl HostPipeline {
         }
         let host = host()?;
 
-        // The root signature the translated shaders' bindings define.
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
-        let mut samplers = Vec::new();
-        let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
+        // Appends one stage's user data, root views, and static samplers to a
+        // root-signature description.
+        let add_stage = |shader: &Arc<Shader>,
+                         visibility: D3D12_SHADER_VISIBILITY,
+                         params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+                         samplers: &mut Vec<D3D12_STATIC_SAMPLER_DESC>|
+         -> Option<Stage> {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
@@ -447,24 +454,24 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
-            bound.push(stage);
-        }
-        // The fallback's buffers: u0-u2 for the compute pass, t0-t2 for the
-        // vertex shader.
-        let fallback_params = fallback.as_ref().map(|_| {
-            let first = params.len() as u32;
-            let (uav, srv) = (D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_PARAMETER_TYPE_SRV);
-            let (all, vertex) = (D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_VERTEX);
-            for (register, kind, visibility) in [
-                (0, uav, all),
-                (1, uav, all),
-                (2, uav, all),
-                (0, srv, vertex),
-                (1, srv, vertex),
-                (2, srv, vertex),
-            ] {
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: kind,
+            Some(stage)
+        };
+
+        // The root signature(s) the translated shaders' bindings define.
+        // Mesh fallback uses a dedicated compute root signature for the mesh
+        // stage (`VISIBILITY_ALL` + `u0`-`u2`) and a graphics root signature
+        // for the pixel stage (`VISIBILITY_PIXEL` + `t0`-`t2`), avoiding
+        // register-space overlap between `ALL` and `PIXEL` bindings.
+        let mut bound = Vec::new();
+        let (root, root_blob, fallback_roots) = if fallback.is_some() {
+            let mut cs_params = Vec::new();
+            let mut cs_samplers = Vec::new();
+            let (ms_shader, ms_vis) = &stages[0];
+            bound.push(add_stage(ms_shader, *ms_vis, &mut cs_params, &mut cs_samplers)?);
+            let out_first = cs_params.len() as u32;
+            for register in 0..3 {
+                cs_params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                     Anonymous: D3D12_ROOT_PARAMETER1_0 {
                         Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                             ShaderRegister: register,
@@ -472,20 +479,70 @@ impl HostPipeline {
                             Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                         },
                     },
-                    ShaderVisibility: visibility,
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 });
             }
-            (
-                [first, first + 1, first + 2],
-                [first + 3, first + 4, first + 5],
-            )
-        });
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
+            let (cs_root, cs_blob) =
+                match root_signature(&host.device, &cs_params, &cs_samplers, true) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "host mesh fallback compute root signature refused");
+                        return None;
+                    }
+                };
+
+            let mut gfx_params = Vec::new();
+            let mut gfx_samplers = Vec::new();
+            for &(shader, visibility) in &stages[1..] {
+                bound.push(add_stage(shader, visibility, &mut gfx_params, &mut gfx_samplers)?);
             }
+            let in_first = gfx_params.len() as u32;
+            for register in 0..3 {
+                gfx_params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: register,
+                            RegisterSpace: MESH_OUT_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+                });
+            }
+            let (gfx_root, gfx_blob) =
+                match root_signature(&host.device, &gfx_params, &gfx_samplers, false) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "host mesh fallback graphics root signature refused");
+                        return None;
+                    }
+                };
+            (
+                gfx_root,
+                gfx_blob,
+                Some((
+                    cs_root,
+                    cs_blob,
+                    [out_first, out_first + 1, out_first + 2],
+                    [in_first, in_first + 1, in_first + 2],
+                )),
+            )
+        } else {
+            let mut params = Vec::new();
+            let mut samplers = Vec::new();
+            for &(shader, visibility) in &stages {
+                bound.push(add_stage(shader, visibility, &mut params, &mut samplers)?);
+            }
+            let (root, root_blob) =
+                match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                        return None;
+                    }
+                };
+            (root, root_blob, None)
         };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
@@ -537,18 +594,21 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
-        if let (Some((f, vertex)), Some((outputs, inputs))) = (fallback, fallback_params) {
+        if let (Some((f, vertex)), Some((compute_root, compute_root_blob, outputs, inputs))) =
+            (fallback, fallback_roots)
+        {
             let bytes = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr().cast(),
                 BytecodeLength: dxil.len(),
             };
             let cs = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
-                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                pRootSignature: unsafe { std::mem::transmute_copy(&compute_root) },
                 CS: bytes(&f.compute.dxil),
                 ..Default::default()
             };
-            let name = super::library::name("mesh-fallback-cs", &root_blob, &[&f.compute.dxil], "");
+            let name =
+                super::library::name("mesh-fallback-cs", &compute_root_blob, &[&f.compute.dxil], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -611,6 +671,7 @@ impl HostPipeline {
             crate::host::name(&compute_pso, || format!("{shaders:?} fallback compute"));
             let signatures = crate::mesh_indirect::signatures(
                 &host.device,
+                &compute_root,
                 &root,
                 outputs,
                 inputs[0],
@@ -625,6 +686,7 @@ impl HostPipeline {
                 mesh: true,
                 fallback: Some(MeshFallback {
                     compute: compute_pso,
+                    root: compute_root,
                     layout: f.layout,
                     outputs,
                     inputs,
@@ -847,5 +909,68 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Splitting mesh-fallback into compute (`VISIBILITY_ALL`) and graphics
+    /// (`VISIBILITY_PIXEL` + `VISIBILITY_VERTEX`) root signatures avoids CBV/SRV
+    /// register overlap in `USER_DATA_SPACE` / `ROOT_CBV_SPACE`.
+    #[test]
+    fn mesh_fallback_separate_root_signatures_avoid_visibility_overlap() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let user_data = |vis| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: vis,
+        };
+        let mesh_out = |kind, reg, vis| D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: reg,
+                    RegisterSpace: MESH_OUT_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: vis,
+        };
+        // Combined VISIBILITY_ALL + VISIBILITY_PIXEL on b0, space 0 is rejected by D3D12.
+        let combined = [
+            user_data(D3D12_SHADER_VISIBILITY_ALL),
+            user_data(D3D12_SHADER_VISIBILITY_PIXEL),
+        ];
+        assert!(root_signature(&host.device, &combined, &[], false).is_err());
+
+        // Split compute and graphics root signatures both succeed.
+        let cs_params = [
+            user_data(D3D12_SHADER_VISIBILITY_ALL),
+            mesh_out(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, D3D12_SHADER_VISIBILITY_ALL),
+            mesh_out(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, D3D12_SHADER_VISIBILITY_ALL),
+            mesh_out(D3D12_ROOT_PARAMETER_TYPE_UAV, 2, D3D12_SHADER_VISIBILITY_ALL),
+        ];
+        let gfx_params = [
+            user_data(D3D12_SHADER_VISIBILITY_PIXEL),
+            mesh_out(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, D3D12_SHADER_VISIBILITY_VERTEX),
+            mesh_out(D3D12_ROOT_PARAMETER_TYPE_SRV, 1, D3D12_SHADER_VISIBILITY_VERTEX),
+            mesh_out(D3D12_ROOT_PARAMETER_TYPE_SRV, 2, D3D12_SHADER_VISIBILITY_VERTEX),
+        ];
+        let (cs_root, _) = root_signature(&host.device, &cs_params, &[], true)
+            .expect("compute root signature");
+        let (gfx_root, _) = root_signature(&host.device, &gfx_params, &[], false)
+            .expect("graphics root signature");
+        crate::mesh_indirect::signatures(&host.device, &cs_root, &gfx_root, [1, 2, 3], 1, false)
+            .expect("indirect signatures with separate roots");
     }
 }
