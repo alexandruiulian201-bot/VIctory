@@ -156,7 +156,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail (unmapped).
+/// block by block if they span views. Unmapped placeholder blocks cannot be
+/// protected, but their bytes remain zero until `title_memory_remapped` marks
+/// them dirty, so they are noted clean to avoid repeating failing
+/// `VirtualProtect` and fallback copies on every submission.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
@@ -171,17 +174,14 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             ) != 0
         }
     };
-    let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
-    };
+    g.clean.extend(from..to);
     if set(from, to) {
-        note(g, from, to);
+        g.protected.extend(from..to);
         return;
     }
     for block in from..to {
         if set(block, block + 1) {
-            note(g, block, block + 1);
+            g.protected.insert(block);
         }
     }
 }
@@ -215,16 +215,16 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// shows is new and read-write, so it is no longer guarded or clean.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in blocks {
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let protected: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+    for block in protected {
         g.protected.remove(&block);
+    }
+    let clean: Vec<usize> = g.clean.range(range).copied().collect();
+    for block in clean {
         g.clean.remove(&block);
     }
 }

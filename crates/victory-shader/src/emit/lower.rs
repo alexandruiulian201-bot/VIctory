@@ -777,8 +777,8 @@ impl<'a> Lower<'a> {
                         if console_lanes {
                             s.wave_size = Some(32);
                         }
-                    } else {
-                        s.wave_size = Some(wave);
+                    } else if console_lanes {
+                        s.wave_size = Some(32);
                     }
                 }
             } else if !console_lanes && x.native.wave64 && one_wave && s.lds_dwords > 0 && uniform_cf {
@@ -2687,6 +2687,12 @@ impl<'a> Lower<'a> {
     }
 
     fn host_read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = if (32..64).contains(&self.x.max_wave) && self.x.native.wave64 {
+            let k31 = self.s.m.i32(31);
+            self.s.m.bin(self.cur, Bin::And, lane, k31)
+        } else {
+            lane
+        };
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",

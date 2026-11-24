@@ -111,13 +111,15 @@ impl Snapshot {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
+/// An empty buffer with room for `n` bytes, from the pool if it has one
+/// (bounded so small spans never steal the 174 MiB world heap buffer).
 fn pooled(n: usize) -> Vec<u8> {
+    let max_fit = n.saturating_mul(2).max(16 << 20);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let fit = pool
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
+        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= max_fit)
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
     let mut v = match fit {
@@ -128,14 +130,14 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Maximum bytes held idle in the snapshot pool across all buffers: keeps at
-/// most 1 large buffer (up to 192 MiB, covering the title's 174 MiB world heap
-/// without per-frame VirtualAlloc/page-fault thrash) or up to 2 buffers within
-/// 192 MiB total.
-const MAX_POOLED_BYTES: usize = 192 << 20;
+/// Maximum bytes held idle in the snapshot pool across all buffers: keeps up to
+/// 8 buffers within 384 MiB total so the world's 174 MiB + 50 MiB + 45 MiB +
+/// 24-25 MiB buffers stay resident across all ~27 submissions per frame without
+/// per-submission `VirtualAlloc`/`VirtualFree` page-fault thrash.
+const MAX_POOLED_BYTES: usize = 384 << 20;
 
-/// Returns a snapshot buffer to the pool (at most 2 kept and at most
-/// [`MAX_POOLED_BYTES`] total, so large heaps do not pin ~1.4 GiB idle).
+/// Returns a snapshot buffer to the pool (at most 8 kept and at most
+/// [`MAX_POOLED_BYTES`] total).
 fn give_back(v: Vec<u8>) {
     if v.capacity() > MAX_POOLED_BYTES {
         return;
@@ -143,7 +145,7 @@ fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(2);
+    pool.truncate(8);
     let mut total: usize = pool.iter().map(Vec::capacity).sum();
     while total > MAX_POOLED_BYTES {
         let Some(dropped) = pool.pop() else { break };

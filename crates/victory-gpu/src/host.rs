@@ -59,15 +59,17 @@ pub(crate) struct Host {
     formats: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
     /// Pooled 1 MiB upload chunks returned by reset command lists (capped).
     scratch_pool: Mutex<Vec<ScratchChunk>>,
-    /// Shared prelude allocator and lazily grown command lists, reset per submission chunk.
+    /// Pooled UAV buffers returned by reset command lists for mesh fallback (capped).
+    mesh_pool: Mutex<Vec<(ID3D12Resource, u64)>>,
+    /// Shared prelude command allocators and lists (1:1 paired), reset per submission chunk.
     prelude: Mutex<Option<PreludePool>>,
     /// Adaptive command-list chunk size for `Host::execute` (1..=16).
     chunk_size: AtomicU32,
 }
 
+#[derive(Default)]
 struct PreludePool {
-    allocator: ID3D12CommandAllocator,
-    lists: Vec<ID3D12GraphicsCommandList>,
+    lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
 }
 
 // SAFETY: only accessed while `Host::submitted` is held.
@@ -276,6 +278,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             formats: Mutex::default(),
             scratch_pool: Mutex::default(),
+            mesh_pool: Mutex::default(),
             prelude: Mutex::new(None),
             chunk_size: AtomicU32::new(8),
         })
@@ -349,6 +352,8 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Whether `self.list.Close()` succeeded on the current recording.
+    closed_ok: std::sync::atomic::AtomicBool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -442,6 +447,7 @@ struct Scratch {
 
 const SCRATCH_CHUNK: u64 = 1 << 20;
 const SCRATCH_POOL_MAX: usize = 32;
+const MESH_POOL_MAX_BYTES: u64 = 64 << 20;
 
 /// Per-list buffers for ordered mesh fallback passes.
 #[derive(Default)]
@@ -486,6 +492,11 @@ impl Pool {
 
     fn reset(&mut self) {
         self.touched = false;
+    }
+
+    fn take(&mut self) -> Option<(ID3D12Resource, u64)> {
+        self.touched = false;
+        self.buffer.take()
     }
 }
 
@@ -664,6 +675,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                closed_ok: std::sync::atomic::AtomicBool::new(true),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 mesh_scratch: Mutex::default(),
@@ -678,7 +690,7 @@ impl Host {
         }
     }
 
-    /// Takes a cached 4 MiB upload chunk from the shared pool or allocates one.
+    /// Takes a cached 1 MiB upload chunk from the shared pool or allocates one.
     fn take_scratch(&self) -> Option<ScratchChunk> {
         if let Some(chunk) = self
             .scratch_pool
@@ -699,7 +711,7 @@ impl Host {
         })
     }
 
-    /// Returns freed 4 MiB scratch chunks to the pool up to `SCRATCH_POOL_MAX`.
+    /// Returns freed 1 MiB scratch chunks to the pool up to `SCRATCH_POOL_MAX`.
     fn return_scratch(&self, chunks: Vec<ScratchChunk>) {
         let overflow: Vec<ScratchChunk> = {
             let mut pool = self.scratch_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -711,49 +723,87 @@ impl Host {
         drop(overflow);
     }
 
-    /// Allocates or reuses a prelude graphics command list from `pool` (sharing
-    /// one allocator reset once per chunk).
+    /// Takes a pooled mesh-fallback UAV buffer of at least `size` bytes, or allocates one.
+    fn take_mesh_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        let found = {
+            let mut pool = self.mesh_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let idx = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, s))| *s >= size && *s <= size.saturating_mul(2))
+                .min_by_key(|(_, (_, s))| *s)
+                .map(|(i, _)| i);
+            idx.map(|i| pool.swap_remove(i).0)
+        };
+        if let Some(buf) = found {
+            return Some(buf);
+        }
+        let buffer = self.uav_buffer(size)?;
+        name(&buffer, || format!("mesh fallback {size:#x}"));
+        Some(buffer)
+    }
+
+    /// Returns mesh-fallback UAV buffers to the shared pool up to `MESH_POOL_MAX_BYTES`.
+    fn return_mesh_scratch(&self, buffers: Vec<(ID3D12Resource, u64)>) {
+        let overflow: Vec<(ID3D12Resource, u64)> = {
+            let mut pool = self.mesh_pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.extend(buffers);
+            pool.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+            let mut total = 0u64;
+            let mut keep = 0;
+            for &(_, s) in pool.iter() {
+                if total + s <= MESH_POOL_MAX_BYTES && keep < 16 {
+                    total += s;
+                    keep += 1;
+                } else {
+                    break;
+                }
+            }
+            pool.split_off(keep)
+        };
+        drop(overflow);
+    }
+
+    /// Allocates or reuses a 1:1 paired `(ID3D12CommandAllocator, ID3D12GraphicsCommandList)`
+    /// from `pool` at `slot`, resetting its dedicated allocator before recording.
     fn take_prelude_list<'a>(
         &self,
         pool: &'a mut Option<PreludePool>,
         slot: &mut usize,
     ) -> Option<(&'a ID3D12CommandAllocator, &'a ID3D12GraphicsCommandList)> {
-        let pool = match pool {
-            Some(p) => p,
-            None => {
-                // SAFETY: plain object creation.
-                let allocator: ID3D12CommandAllocator = unsafe {
-                    self.device
-                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                        .ok()?
-                };
-                pool.insert(PreludePool {
-                    allocator,
-                    lists: Vec::new(),
-                })
-            }
-        };
+        let pool = pool.get_or_insert_with(PreludePool::default);
         if *slot == pool.lists.len() {
             // SAFETY: plain object creation; closed before returning.
-            let cmd: ID3D12GraphicsCommandList = unsafe {
+            let pair = unsafe {
+                let allocator: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .ok()?;
                 let cmd: ID3D12GraphicsCommandList = self
                     .device
-                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &pool.allocator, None)
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
                     .ok()?;
                 cmd.Close().ok()?;
-                cmd
+                (allocator, cmd)
             };
-            pool.lists.push(cmd);
+            pool.lists.push(pair);
         }
         let i = *slot;
         *slot += 1;
-        Some((&pool.allocator, &pool.lists[i]))
+        let (allocator, cmd) = &pool.lists[i];
+        // SAFETY: previous chunk waited for fence completion before reusing slot `i`.
+        if let Err(e) = unsafe { allocator.Reset() } {
+            tracing::warn!(error = %e, slot = i, "a host prelude allocator did not reset");
+            self.log_messages();
+            return None;
+        }
+        Some((allocator, cmd))
     }
 
     /// Records a single prelude list that uploads all dirty title-written
-    /// textures in this submission into VRAM (`COPY_DEST`), leaving `copy.state`
-    /// set to `COPY_DEST` so each list's own prelude transitions to its expected
-    /// first state (`SHADER_RESOURCE`, `COPY_SOURCE`, etc.).
+    /// textures in this submission into VRAM (`COPY_DEST`), returning the
+    /// command list and the transient upload buffers to keep alive until the
+    /// chunk completes on the GPU.
     fn prelude_texture_uploads(
         &self,
         pool: &mut Option<PreludePool>,
@@ -762,7 +812,7 @@ impl Host {
             std::sync::Arc<crate::texture::Staging>,
             std::sync::Arc<crate::resource::HostTexture>,
         )],
-    ) -> Option<ID3D12CommandList> {
+    ) -> Option<(ID3D12CommandList, Vec<ID3D12Resource>)> {
         if dirty.is_empty() {
             return None;
         }
@@ -781,27 +831,31 @@ impl Host {
             })
             .collect();
         let (allocator, cmd) = self.take_prelude_list(pool, slot)?;
-        // SAFETY: allocator was reset before this chunk and only one prelude
-        // list records into it at a time.
+        let mut uploads = Vec::with_capacity(dirty.len());
+        // SAFETY: dedicated allocator was just reset above.
         let recorded = unsafe {
             cmd.Reset(allocator, None).and_then(|()| {
                 if !barriers.is_empty() {
                     cmd.ResourceBarrier(&barriers);
                 }
                 for (staging, copy) in dirty {
-                    staging.record_copy(cmd, &copy.texture);
+                    if let Some(buf) = staging.record_copy(cmd, &copy.texture) {
+                        uploads.push(buf);
+                    }
                 }
                 cmd.Close()
             })
         };
         if let Err(e) = recorded {
-            fail(format_args!("a host texture upload prelude did not record ({e})"));
+            tracing::warn!(error = %e, count = dirty.len(), "a host texture upload prelude did not record");
+            self.log_messages();
+            return None;
         }
-        cmd.cast().ok()
+        Some((cmd.cast().ok()?, uploads))
     }
 
     /// Records prelude transition barriers for `list` into the `slot`-th
-    /// shared prelude list (sharing one allocator reset once per chunk).
+    /// prelude list.
     fn prelude_into(
         &self,
         pool: &mut Option<PreludePool>,
@@ -826,8 +880,7 @@ impl Host {
             return None;
         }
         let (allocator, cmd) = self.take_prelude_list(pool, slot)?;
-        // SAFETY: `allocator` was reset before this chunk and only one
-        // prelude list records into it at a time.
+        // SAFETY: dedicated allocator was just reset above.
         let recorded = unsafe {
             cmd.Reset(allocator, None).and_then(|()| {
                 cmd.ResourceBarrier(&barriers);
@@ -835,7 +888,9 @@ impl Host {
             })
         };
         if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
+            tracing::warn!(error = %e, "a host state prelude did not record");
+            self.log_messages();
+            return None;
         }
         cmd.cast().ok()
     }
@@ -871,43 +926,43 @@ impl Host {
             let step = (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, 16);
             let end = (idx + step).min(runs.len());
             let chunk = &runs[idx..end];
-            if let Some(pool) = prelude_pool.as_mut() {
-                // SAFETY: previous chunk waited for fence completion.
-                if let Err(e) = unsafe { pool.allocator.Reset() } {
-                    fail(format_args!("a host prelude allocator did not reset ({e})"));
-                }
-            }
             let mut slot = 0;
             let mut group = Vec::with_capacity(chunk.len() * 2 + usize::from(idx == 0));
+            let mut _chunk_uploads = Vec::new();
             if idx == 0
-                && let Some(upload_prelude) = self.prelude_texture_uploads(
+                && let Some((upload_prelude, uploads)) = self.prelude_texture_uploads(
                     &mut prelude_pool,
                     &mut slot,
                     &batch.dirty_textures,
                 )
             {
                 group.push(Some(upload_prelude));
+                _chunk_uploads = uploads;
             }
             for run in chunk {
                 if let Some(prelude) = self.prelude_into(&mut prelude_pool, &mut slot, run) {
                     group.push(Some(prelude));
                 }
-                group.push(run.list.cast().ok());
+                if run.closed_ok.load(Ordering::Relaxed) {
+                    group.push(run.list.cast().ok());
+                }
             }
-            *submitted += 1;
             let chunk_started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(&group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+            if !group.is_empty() {
+                *submitted += 1;
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(&group);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
             let chunk_elapsed = chunk_started.elapsed();
@@ -1256,16 +1311,25 @@ impl HostList {
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
-            ));
+        match unsafe { self.list.Close() } {
+            Ok(()) => self.closed_ok.store(true, Ordering::Relaxed),
+            Err(e) => {
+                self.closed_ok.store(false, Ordering::Relaxed);
+                tracing::warn!(
+                    error = %e,
+                    "a host command list did not close: skipping its GPU execution on submission"
+                );
+                if let Some(host) = host() {
+                    host.log_messages();
+                }
+            }
         }
     }
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.closed_ok.store(true, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1281,12 +1345,15 @@ impl HostList {
         {
             host.return_scratch(drained);
         }
-        self.mesh_scratch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pools
-            .iter_mut()
-            .for_each(Pool::reset);
+        let mesh_drained: Vec<(ID3D12Resource, u64)> = {
+            let mut ms = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            ms.pools.iter_mut().filter_map(Pool::take).collect()
+        };
+        if !mesh_drained.is_empty()
+            && let Some(host) = host()
+        {
+            host.return_mesh_scratch(mesh_drained);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1469,9 +1536,7 @@ impl HostList {
     pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ID3D12Resource> {
         let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
         let (buffer, first) = s.pools[pool as usize].acquire(len, |size| {
-            let buffer = host()?.uav_buffer(size)?;
-            name(&buffer, || format!("mesh fallback {pool:?} {size:#x}"));
-            Some(buffer)
+            host()?.take_mesh_scratch(size)
         })?;
         if first {
             self.keep(&buffer);
@@ -2350,6 +2415,34 @@ impl Meter {
     }
 }
 
+/// Optional presentation resolution cap (`VICTORY_PRESENT_RESOLUTION`, e.g.
+/// `1600x900`, `1280x720`, `1920x1080`, or a width like `1600` / `1280`).
+fn present_resolution_cap() -> Option<(u32, u32)> {
+    static CAP: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var("VICTORY_PRESENT_RESOLUTION").ok()?;
+        let s = raw.trim();
+        let pair = if let Some((w, h)) = s.split_once(['x', 'X']) {
+            let w: u32 = w.trim().parse().ok()?;
+            let h: u32 = h.trim().parse().ok()?;
+            (w, h)
+        } else {
+            let w: u32 = s.parse().ok()?;
+            (w, (w * 9 / 16).max(1))
+        };
+        if pair.0 >= 320 && pair.1 >= 180 {
+            tracing::info!(
+                width = pair.0,
+                height = pair.1,
+                "VICTORY_PRESENT_RESOLUTION: capping presented swapchain resolution"
+            );
+            Some(pair)
+        } else {
+            None
+        }
+    })
+}
+
 impl Host {
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
@@ -2380,6 +2473,12 @@ impl Host {
             width = width.max(d.Width as u32);
             height = height.max(d.Height);
         }
+        if let Some((cap_w, cap_h)) = present_resolution_cap() {
+            width = width.min(cap_w);
+            height = height.min(cap_h);
+        }
+        let use_compositor =
+            planes.len() > 1 || (width, height) != (primary_desc.Width as u32, primary_desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -2406,7 +2505,7 @@ impl Host {
             }
         }
         // Leave the copy list closed if compositor initialization fails.
-        let compositor = if planes.len() > 1 {
+        let compositor = if use_compositor {
             if p.compositor.as_ref().is_none_or(|c| c.format != format) {
                 match create_compositor(&self.device, format) {
                     Ok(c) => p.compositor = Some(c),
@@ -2428,7 +2527,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
+            let (capture, probe) = if !use_compositor {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);

@@ -209,12 +209,15 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
     std::sync::Mutex::new(Vec::new());
 
 /// With `VICTORY_PRESENT_1440P` set: the latest internal world color render
-/// target (`2560x1440` on Series X, or `1600x900`/`1440x810`/`1280x720` on
-/// Series S; formats `f28`/`f29`/`f87`/`f91`) written during the current
-/// frame, substituted as plane 0 at present time when the title's upscaled
-/// output stays zero (#841).
-static LAST_WORLD_TARGET: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
-    std::sync::Mutex::new(None);
+/// target (`2560x1440` on Series X, or `1920x1080`/`1600x900`/`1440x810`/`1280x720`
+/// on Series S; typed and typeless 8/10-bit color formats) written during the
+/// current frame, substituted as plane 0 at present time when the title's
+/// upscaled output stays zero (#841). Tracks `(width, texture)` so a smaller
+/// auxiliary target rendered later in the frame never overwrites a larger
+/// main world target.
+static LAST_WORLD_TARGET: std::sync::Mutex<
+    Option<(u64, std::sync::Arc<crate::resource::HostTexture>)>,
+> = std::sync::Mutex::new(None);
 
 fn present_1440p_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -231,6 +234,7 @@ pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::Host
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
+        .map(|(_, copy)| copy)
 }
 
 fn dump_on() -> bool {
@@ -252,11 +256,14 @@ pub(crate) fn note_target(resource: crate::object::This) {
             && d.SampleDesc.Count == 1
             && matches!(
                 (d.Width, d.Height),
-                (2560, 1440) | (1600, 900) | (1440, 810) | (1280, 720)
+                (2560, 1440) | (1920, 1080) | (1600, 900) | (1440, 810) | (1280, 720)
             )
-            && matches!(d.Format.0, 28 | 29 | 87 | 91)
+            && matches!(d.Format.0, 23 | 24 | 27 | 28 | 29 | 87 | 90 | 91)
         {
-            *LAST_WORLD_TARGET.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+            let mut slot = LAST_WORLD_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_none_or(|(prev_w, _)| d.Width >= *prev_w) {
+                *slot = Some((d.Width, copy));
+            }
         }
     }
     if !dump_on() || !listed(crate::queue::presented() + 1) {

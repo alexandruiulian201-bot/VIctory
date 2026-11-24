@@ -161,6 +161,8 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    } else if !at.is_null() {
+        victory_gpu::title_memory_remapped(base as usize, size);
     }
     at
 }

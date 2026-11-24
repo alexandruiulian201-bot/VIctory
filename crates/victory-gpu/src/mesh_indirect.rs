@@ -29,7 +29,7 @@ use windows::core::s;
 /// The output one indirect mesh dispatch may write (vertex, index and
 /// per-primitive records of all its records' groups, with their regions'
 /// alignment): a power of two, so the list's buffer is no bigger.
-pub(crate) const BYTES: u64 = 32 << 20;
+pub(crate) const BYTES: u64 = 8 << 20;
 /// Bytes per compute command: three root UAV addresses, a dispatch, and
 /// padding to keep addresses 8-byte aligned.
 pub(crate) const COMPUTE_STRIDE: u32 = 40;
