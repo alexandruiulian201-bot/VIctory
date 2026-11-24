@@ -70,9 +70,10 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): doubled from 2^16 to 2^17 so world frames do
-/// not exhaust dynamic CBV/table slots under NVIDIA's 1,000,000 view cap.
-const MIN_DYNAMIC: u32 = 1 << 17;
+/// (a capped heap, NVIDIA): kept at 2^16 so 934,464 title slots stay
+/// mirrored under NVIDIA's 1,000,000 view cap (active bindless indices
+/// reach ~888k right after loading).
+const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// Computes `(mirrored_count, dynamic_count)` when `count + DYNAMIC` fails
 /// (e.g. NVIDIA's [`PORTABLE_VIEWS`] limit of 1,000,000 views).
@@ -999,8 +1000,9 @@ mod tests {
     fn capped_layout_preserves_dynamic_headroom() {
         assert_eq!(capped_layout(100_000), (100_000, MIN_DYNAMIC));
         assert_eq!(capped_layout(800_000), (800_000, PORTABLE_VIEWS - 800_000));
+        assert_eq!(capped_layout(900_000), (900_000, PORTABLE_VIEWS - 900_000));
         assert_eq!(
-            capped_layout(900_000),
+            capped_layout(950_000),
             (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
         );
         assert_eq!(
