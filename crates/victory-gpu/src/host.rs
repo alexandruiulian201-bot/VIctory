@@ -506,9 +506,13 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Brings a texture's staging buffer up to date: once per submission,
+    /// Brings a texture's staging buffer up to date and queues a prelude
+    /// `CopyTextureRegion` only when its contents changed: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -707,31 +711,13 @@ impl Host {
         drop(overflow);
     }
 
-    /// Records prelude transition barriers for `list` into the `slot`-th
-    /// shared prelude list (sharing one allocator reset once per chunk).
-    fn prelude_into(
+    /// Allocates or reuses a prelude graphics command list from `pool` (sharing
+    /// one allocator reset once per chunk).
+    fn take_prelude_list<'a>(
         &self,
-        pool: &mut Option<PreludePool>,
+        pool: &'a mut Option<PreludePool>,
         slot: &mut usize,
-        list: &HostList,
-    ) -> Option<ID3D12CommandList> {
-        let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
-        if barriers.is_empty() {
-            return None;
-        }
+    ) -> Option<(&'a ID3D12CommandAllocator, &'a ID3D12GraphicsCommandList)> {
         let pool = match pool {
             Some(p) => p,
             None => {
@@ -759,12 +745,91 @@ impl Host {
             };
             pool.lists.push(cmd);
         }
-        let cmd = &pool.lists[*slot];
+        let i = *slot;
         *slot += 1;
-        // SAFETY: `pool.allocator` was reset before this chunk and only one
+        Some((&pool.allocator, &pool.lists[i]))
+    }
+
+    /// Records a single prelude list that uploads all dirty title-written
+    /// textures in this submission into VRAM (`COPY_DEST`), leaving `copy.state`
+    /// set to `COPY_DEST` so each list's own prelude transitions to its expected
+    /// first state (`SHADER_RESOURCE`, `COPY_SOURCE`, etc.).
+    fn prelude_texture_uploads(
+        &self,
+        pool: &mut Option<PreludePool>,
+        slot: &mut usize,
+        dirty: &[(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )],
+    ) -> Option<ID3D12CommandList> {
+        if dirty.is_empty() {
+            return None;
+        }
+        const COPY_DEST: u32 = 0x400;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = dirty
+            .iter()
+            .filter_map(|(_, copy)| {
+                let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
+                (real != COPY_DEST).then(|| {
+                    transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATES(COPY_DEST as i32),
+                    )
+                })
+            })
+            .collect();
+        let (allocator, cmd) = self.take_prelude_list(pool, slot)?;
+        // SAFETY: allocator was reset before this chunk and only one prelude
+        // list records into it at a time.
+        let recorded = unsafe {
+            cmd.Reset(allocator, None).and_then(|()| {
+                if !barriers.is_empty() {
+                    cmd.ResourceBarrier(&barriers);
+                }
+                for (staging, copy) in dirty {
+                    staging.record_copy(cmd, &copy.texture);
+                }
+                cmd.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("a host texture upload prelude did not record ({e})"));
+        }
+        cmd.cast().ok()
+    }
+
+    /// Records prelude transition barriers for `list` into the `slot`-th
+    /// shared prelude list (sharing one allocator reset once per chunk).
+    fn prelude_into(
+        &self,
+        pool: &mut Option<PreludePool>,
+        slot: &mut usize,
+        list: &HostList,
+    ) -> Option<ID3D12CommandList> {
+        let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+            .values()
+            .filter_map(|(first, last, copy)| {
+                let real = copy.state.swap(*last, Ordering::Relaxed);
+                (real != *first).then(|| {
+                    transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATES(*first as i32),
+                    )
+                })
+            })
+            .collect();
+        if barriers.is_empty() {
+            return None;
+        }
+        let (allocator, cmd) = self.take_prelude_list(pool, slot)?;
+        // SAFETY: `allocator` was reset before this chunk and only one
         // prelude list records into it at a time.
         let recorded = unsafe {
-            cmd.Reset(&pool.allocator, None).and_then(|()| {
+            cmd.Reset(allocator, None).and_then(|()| {
                 cmd.ResourceBarrier(&barriers);
                 cmd.Close()
             })
@@ -813,7 +878,16 @@ impl Host {
                 }
             }
             let mut slot = 0;
-            let mut group = Vec::with_capacity(chunk.len() * 2);
+            let mut group = Vec::with_capacity(chunk.len() * 2 + usize::from(idx == 0));
+            if idx == 0
+                && let Some(upload_prelude) = self.prelude_texture_uploads(
+                    &mut prelude_pool,
+                    &mut slot,
+                    &batch.dirty_textures,
+                )
+            {
+                group.push(Some(upload_prelude));
+            }
             for run in chunk {
                 if let Some(prelude) = self.prelude_into(&mut prelude_pool, &mut slot, run) {
                     group.push(Some(prelude));
@@ -1462,9 +1536,14 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// submitted (and uploads it in the submission prelude only when dirty),
+    /// keeping both alive until the list is reset.
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1523,9 +1602,9 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                Step::Texture(staging, copy) => {
+                    if batch.texture_due(staging) && staging.refresh() {
+                        batch.note_dirty_texture(staging, copy);
                     }
                     continue;
                 }
@@ -1549,6 +1628,11 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Dirty textures that need a prelude `CopyTextureRegion` before this submission runs.
+    dirty_textures: Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )>,
 }
 
 impl Batch {
@@ -1568,6 +1652,21 @@ impl Batch {
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    /// Records a dirty texture once per submission for the upload prelude.
+    fn note_dirty_texture(
+        &mut self,
+        staging: &std::sync::Arc<crate::texture::Staging>,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        if !self
+            .dirty_textures
+            .iter()
+            .any(|(_, c)| std::sync::Arc::ptr_eq(c, copy))
+        {
+            self.dirty_textures.push((staging.clone(), copy.clone()));
+        }
     }
 
     /// Before a step that writes title memory: pending refreshes are done
