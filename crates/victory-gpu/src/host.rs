@@ -490,6 +490,7 @@ impl Pool {
         Some((self.buffer.as_ref()?.0.clone(), first))
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.touched = false;
     }
@@ -909,10 +910,15 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Submit in adaptive chunks (default 8, 1..=16) so 30-50 list world
-        // submissions avoid per-list CPU<->GPU drain stalls while still
-        // staying well below Windows' ~2 s TDR timeout (auto-halving on >250 ms
-        // chunks; always 1 when per-list GPU timing is enabled).
+        // Submit in bounded chunks so heavy mesh-fallback world submissions
+        // stay well below Windows' ~2 s TDR timeout (1 list per submission on
+        // mesh-fallback GPUs like Pascal, or up to 4 on native mesh-shader
+        // GPUs; overridable with `VICTORY_CHUNK_SIZE`).
+        let max_chunk: usize = std::env::var("VICTORY_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or_else(|| if self.mesh_fallback() { 1 } else { 4 });
         let mut prelude_pool = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
         let mut idx = 0;
         while idx < runs.len() {
@@ -920,10 +926,10 @@ impl Host {
             let step = if timing() {
                 1
             } else {
-                (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, 16)
+                (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, max_chunk)
             };
             #[cfg(not(feature = "diagnostics"))]
-            let step = (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, 16);
+            let step = (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, max_chunk);
             let end = (idx + step).min(runs.len());
             let chunk = &runs[idx..end];
             let mut slot = 0;
@@ -982,14 +988,26 @@ impl Host {
                 self.chunk_size
                     .store((step / 2).max(1) as u32, Ordering::Relaxed);
             } else if chunk.len() == step
-                && step < 16
+                && step < max_chunk
                 && chunk_elapsed < std::time::Duration::from_millis(40)
             {
                 self.chunk_size
-                    .store((step * 2).min(16) as u32, Ordering::Relaxed);
+                    .store((step * 2).min(max_chunk) as u32, Ordering::Relaxed);
             }
             // SAFETY: a plain query.
             if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                let chunk_pipelines: std::collections::BTreeSet<String> = chunk
+                    .iter()
+                    .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                    .collect();
+                tracing::error!(
+                    chunk_start = idx,
+                    chunk_end = end,
+                    total_lists = runs.len(),
+                    chunk_ms = chunk_elapsed.as_millis(),
+                    ?chunk_pipelines,
+                    "failing host submission chunk"
+                );
                 break;
             }
             idx = end;
