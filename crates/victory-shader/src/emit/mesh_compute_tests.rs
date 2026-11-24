@@ -217,6 +217,7 @@ fn lowered_with_max_primitives(
         prims: prim_outputs(prims),
         mesh_stride: max_primitives,
         mesh_as_compute: as_compute,
+        max_wave: 64,
     })
     .expect("lower");
     let s = shader(HwStage::Ms, l.dxil);
@@ -1011,6 +1012,7 @@ fn bench_lowered() -> (HostShader, MeshLayout) {
         prims: Vec::new(),
         mesh_stride: 32,
         mesh_as_compute: true,
+        max_wave: 64,
     })
     .expect("lower");
     let s = shader(HwStage::Ms, l.dxil);

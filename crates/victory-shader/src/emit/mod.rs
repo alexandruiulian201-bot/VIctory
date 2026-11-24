@@ -344,7 +344,7 @@ pub fn emit_mesh_as_compute(
             what: "a mesh program run as compute that is no mesh program",
         });
     };
-    let (compute, outputs, prims) = emit_with(c, native, p, st, io, res, true)?;
+    let (compute, outputs, prims) = emit_with(c, native, p, st, io, res, true, 64)?;
     let layout = MeshLayout {
         threads: ms.threads,
         max_vertices: ms.max_vertices,
@@ -385,6 +385,13 @@ fn fallback_vertex_shader(
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for_wave(container, 64)
+}
+
+/// Translates a console shader container targeting a host with maximum
+/// supported wave lane count `max_wave` (emulating wave64 compute shaders
+/// when `max_wave < 64` where possible).
+pub fn translate_for_wave(container: &[u8], max_wave: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -408,7 +415,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for_wave(&c, &native, &p, &st, &io, &res, max_wave)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -420,7 +427,20 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    emit_with(c, native, p, st, io, res, false).map(|e| e.0)
+    emit_for_wave(c, native, p, st, io, res, 64)
+}
+
+/// Emits a program whose earlier stages already ran, targeting `max_wave`.
+pub fn emit_for_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    max_wave: u32,
+) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, false, max_wave).map(|e| e.0)
 }
 
 /// [`emit`], or a mesh program as compute: the shader, and the output and
@@ -433,6 +453,7 @@ fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     mesh_as_compute: bool,
+    max_wave: u32,
 ) -> Result<(HostShader, Vec<container::SigElement>, Vec<container::SigElement>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -501,6 +522,7 @@ fn emit_with(
         prims,
         mesh_stride,
         mesh_as_compute,
+        max_wave,
     })?;
     let shader = HostShader {
         stage: native.stage,

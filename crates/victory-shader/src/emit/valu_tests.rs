@@ -138,6 +138,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         mesh_as_compute: false,
+        max_wave: 64,
     })
     .expect("lower");
 
@@ -1009,6 +1010,8 @@ fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
+        max_wave: 64,
     })
     .expect("lower");
     let mut shader = HostShader {
@@ -1048,4 +1051,317 @@ fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Assembles, lowers with `max_wave: 32`, validates, and runs a wave64
+/// compute shader on hardware / WARP adapters that support `WaveSize(32)`.
+fn run_wave64_on_wave32(
+    threads: [u32; 3],
+    lds_dwords: u32,
+    words: &[u32],
+    out_vreg: u8,
+) -> Option<Vec<u32>> {
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    let total = threads.iter().product::<u32>();
+    let mut full = vec![
+        s_mov_b32(1, 0x80),
+        s_load_dwordx4(8, 0)[0],
+        s_load_dwordx4(8, 0)[1],
+        // v15 = v0 << 2 (dword output byte offset)
+        vop2(0x01a, 15, 0, 0x82),
+    ];
+    full.extend_from_slice(words);
+    full.extend_from_slice(&[
+        // buffer_store_dword v[out_vreg], v15, s[8:11], 0 offen
+        0x38 << 26 | 0x1C << 18 | (1 << 12),
+        0x80 << 24 | ((8 >> 2) << 16) | ((out_vreg as u32) << 8) | 15,
+        S_ENDPGM,
+    ]);
+    let code: Vec<u8> = full.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let rsrc2 = (1 << 1) | ((lds_dwords.div_ceil(128)) << 15);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        mesh_as_compute: false,
+        max_wave: 32,
+    })
+    .expect("lower with max_wave=32");
+    assert!(lowered.wave_ops, "expected WAVE_OPS feature flag");
+    let mut shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    let mut first_out = None;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let Ok((min_w, max_w)) = host.wave_range() else {
+            continue;
+        };
+        if min_w > 32 || max_w < 32 {
+            eprintln!(
+                "{label}: adapter {:?} wave_range=({min_w}, {max_w}) skips WaveSize(32)",
+                host.adapter_name()
+            );
+            continue;
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0]))],
+                    views: &[View::RawUav(total)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        if let Some(prev) = &first_out {
+            assert_eq!(prev, &out[0], "{label} disagreed with hardware output");
+        } else {
+            first_out = Some(out[0].clone());
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no wave-32 SM 6.6 D3D12 device available; skipped execution");
+    }
+    first_out
+}
+
+#[test]
+fn wave64_emulated_ballot_on_wave32() {
+    // v_cmp_gt_u32_e32 vcc, 40, v0 -> lo = 0xFFFF_FFFF, hi = 0x0000_00FF
+    // Even lanes store vcc_lo, odd lanes store vcc_hi.
+    let v_cmp_gt_40 = 0x7C00_0000 | (0x0C4 << 17) | 0xA8; // src0 = 128 + 40 = 0xA8, vsrc1 = v0
+    let v_cmp_lt_32 = 0x7C00_0000 | (0x0C1 << 17) | (0xA0 << 9); // wait: use v1 = v0 < 32 via v_cmp_gt_u32 32, v0
+    let _ = v_cmp_lt_32;
+    let body = [
+        // vcc = (40 > v0)
+        v_cmp_gt_40,
+        // v1 = vcc_lo (s106), v2 = vcc_hi (s107)
+        vop1(0x001, 1, sgpr(106)),
+        vop1(0x001, 2, sgpr(107)),
+        // vcc = (32 > v0): true for subwave 0, false for subwave 1
+        0x7C00_0000 | (0x0C4 << 17) | 0xA0,
+        // v3 = vcc ? v1 : v2 (VOP2 v_cndmask_b32 vdst, src0(false), vsrc1(true))
+        (0x001 << 25) | (3 << 17) | (1 << 9) | vgpr(2) as u32,
+    ];
+    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 3) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        let want = if i < 32 { 0xFFFF_FFFF } else { 0x0000_00FF };
+        assert_eq!(val, want, "lane {i}");
+    }
+}
+
+#[test]
+fn wave64_emulated_readlane_cross_subwave_on_wave32() {
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    let rl_45 = vop3(0x360, 2, vgpr(1), 128 + 45, 0);
+    let rl_7 = vop3(0x360, 3, vgpr(1), 128 + 7, 0);
+    let body = [
+        // v1 = v0 + 100
+        vop2(0x025, 1, 0, 0xFF),
+        100,
+        // s2 = readlane(v1, 45), s3 = readlane(v1, 7)
+        rl_45[0],
+        rl_45[1],
+        rl_7[0],
+        rl_7[1],
+        // v2 = s3 << 16 | s2
+        vop1(0x001, 2, sgpr(3)),
+        vop2(0x01a, 2, 2, 128 + 16),
+        vop2(0x01c, 2, 2, sgpr(2)),
+    ];
+    let Some(out) = run_wave64_on_wave32([128, 1, 1], 0, &body, 2) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        let base = ((i / 64) * 64 + 100) as u32;
+        let want = (base + 45) | ((base + 7) << 16);
+        assert_eq!(val, want, "thread {i}");
+    }
+}
+
+#[test]
+fn wave64_emulated_mbcnt_on_wave32() {
+    let lo = vop3(0x365, 1, 0xC1, 0x80, 0);
+    let hi = vop3(0x366, 1, 0xC1, vgpr(1), 0);
+    let body = [lo[0], lo[1], hi[0], hi[1]];
+    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 1) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        assert_eq!(val, i as u32, "lane {i}");
+    }
+}
+
+#[test]
+fn wave64_emulated_ds_swizzle_and_dpp_row_mask_on_wave32() {
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    // ds_swizzle_b32 v2, v1 offset:0x041F (xor 1 across 32 lanes)
+    let swizzle = [0xD8D4_041F, (2 << 24) | 1];
+    // v_mov_b32_dpp v2, v2 row_shr:1 row_mask:0xA bank_mask:0xF bound_ctrl:1
+    let dpp_shr1_rows13 = [
+        vop1(0x001, 2, 0xFA),
+        2 | (0x111 << 8) | (1 << 19) | (0xF << 24) | (0xA << 28),
+    ];
+    let body = [
+        // v1 = v0 + 10
+        vop2(0x025, 1, 0, 128 + 10),
+        swizzle[0],
+        swizzle[1],
+        dpp_shr1_rows13[0],
+        dpp_shr1_rows13[1],
+    ];
+    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 2) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        let row = i >> 4;
+        let want = if row == 1 || row == 3 {
+            if i & 15 == 0 {
+                0
+            } else {
+                (((i - 1) ^ 1) + 10) as u32
+            }
+        } else {
+            ((i ^ 1) + 10) as u32
+        };
+        assert_eq!(val, want, "lane {i}");
+    }
+}
+
+#[test]
+fn wave64_emulated_reduction_and_prefix_sum_on_wave32() {
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    const fn dpp_add_shr(vdst: u8, k: u32) -> [u32; 2] {
+        [
+            vop2(0x025, vdst, vdst, 0xFA),
+            (vdst as u32) | ((0x110 + k) << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+        ]
+    }
+    let cnd = vop3(0x101, 9, 0x80, vgpr(1), sgpr(2));
+    let rl15 = vop3(0x360, 4, vgpr(2), 128 + 15, 0);
+    let rl31 = vop3(0x360, 5, vgpr(2), 128 + 31, 0);
+    let rl47 = vop3(0x360, 6, vgpr(2), 128 + 47, 0);
+    let rl63 = vop3(0x360, 7, vgpr(2), 128 + 63, 0);
+    let mut body = vec![
+        // v1 = v0 + 1
+        vop2(0x025, 1, 0, 0x81),
+        // s_or_saveexec_b64 s[2:3], -1
+        0xBE82_25C1,
+        // v9 = v_cndmask_b32(0, v1, s[2:3]); v2 = v9
+        cnd[0],
+        cnd[1],
+        vop1(0x001, 2, vgpr(9)),
+    ];
+    for shift in [1, 2, 4, 8] {
+        body.extend_from_slice(&dpp_add_shr(2, shift));
+    }
+    body.extend_from_slice(&[
+        rl15[0], rl15[1],
+        rl31[0], rl31[1],
+        rl47[0], rl47[1],
+        rl63[0], rl63[1],
+        // v3 = s4 + s5, v4 = s6 + s7, v6 = v3 + v4 (wave sum), v7 = v3 + s6
+        vop1(0x001, 3, sgpr(5)),
+        vop2(0x025, 3, 3, sgpr(4)),
+        vop1(0x001, 4, sgpr(7)),
+        vop2(0x025, 4, 4, sgpr(6)),
+        vop2(0x025, 6, 4, vgpr(3)),
+        vop2(0x025, 7, 3, sgpr(6)),
+        // Row 1 (lanes 16..31): exec = 0x0000_0000_FFFF_0000; v2 += s4
+        s_mov_b32(126, 0xFF),
+        0xFFFF_0000,
+        s_mov_b32(127, 0x80),
+        vop2(0x025, 2, 2, sgpr(4)),
+        // Row 2 (lanes 32..47): exec = 0x0000_FFFF_0000_0000; v2 += v3
+        s_mov_b32(126, 0x80),
+        s_mov_b32(127, 0xFF),
+        0x0000_FFFF,
+        vop2(0x025, 2, 2, vgpr(3)),
+        // Row 3 (lanes 48..63): exec = 0xFFFF_0000_0000_0000; v2 += v7
+        s_mov_b32(127, 0xFF),
+        0xFFFF_0000,
+        vop2(0x025, 2, 2, vgpr(7)),
+        // exec = -1
+        0xBEFE_04C1,
+        // v5 = v2 - v9 (exclusive prefix sum)
+        vop2(0x026, 5, 9, vgpr(2)),
+        // Restore exec = s[2:3]
+        0xBEFE_0402,
+        // v8 = v6 | (v5 << 16)
+        vop2(0x01a, 5, 5, 128 + 16),
+        vop2(0x01c, 8, 5, vgpr(6)),
+    ]);
+    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 8) else {
+        return;
+    };
+    let total_sum: u32 = (1..=64).sum();
+    for (i, &val) in out.iter().enumerate() {
+        let prefix: u32 = (1..=i as u32).sum();
+        let want = total_sum | (prefix << 16);
+        assert_eq!(val, want, "lane {i}");
+    }
 }

@@ -186,7 +186,41 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let high_perf = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .ok()
+                .and_then(|f| {
+                    let mut chosen: Option<(IDXGIAdapter1, String)> = None;
+                    for i in 0.. {
+                        match f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                            i,
+                            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                        ) {
+                            Ok(adapter) => {
+                                if let Ok(desc) = adapter.GetDesc1()
+                                    && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                                {
+                                    let end = desc
+                                        .Description
+                                        .iter()
+                                        .position(|&c| c == 0)
+                                        .unwrap_or(desc.Description.len());
+                                    let name = String::from_utf16_lossy(&desc.Description[..end]);
+                                    chosen = Some((adapter, name));
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    chosen
+                });
+            match high_perf {
+                Some((adapter, name)) => {
+                    tracing::info!(adapter = %name, "host GPU adapter");
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -589,6 +623,36 @@ impl Host {
             let fallback = forced || !self.mesh_shaders();
             tracing::info!(fallback, forced, "mesh programs run as compute");
             fallback
+        })
+    }
+
+    /// Maximum wave lane count supported by the host GPU (`WaveLaneCountMax`,
+    /// or `0` when wave operations are unsupported); logged once.
+    pub(crate) fn max_wave_size(&self) -> u32 {
+        static MAX_WAVE: OnceLock<u32> = OnceLock::new();
+        *MAX_WAVE.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: plain query into our initialized struct.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let max_wave = if ok && options.WaveOps.as_bool() {
+                options.WaveLaneCountMax
+            } else {
+                0
+            };
+            tracing::info!(
+                max_wave,
+                min_wave = options.WaveLaneCountMin,
+                "host wave lane count"
+            );
+            max_wave
         })
     }
 
