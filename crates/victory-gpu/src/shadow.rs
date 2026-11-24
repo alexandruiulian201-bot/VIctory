@@ -40,9 +40,72 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// Original bytes of the ranges shaders can write during this submission.
+    before: Mutex<Snapshot>,
+}
+
+/// Non-overlapping spans in address order. A later declaration can overlap an
+/// earlier one: keep the original bytes and only read the uncovered gaps.
+#[derive(Default)]
+struct Snapshot {
+    spans: Vec<(usize, Vec<u8>)>,
+}
+
+impl Snapshot {
+    fn capture(&mut self, start: usize, source: &[u8]) {
+        let end = start + source.len();
+        let mut at = start;
+        let mut i = self.spans.partition_point(|(base, bytes)| base + bytes.len() <= at);
+        while at < end {
+            if let Some((base, bytes)) = self.spans.get(i)
+                && *base <= at
+            {
+                at = base + bytes.len();
+            } else {
+                let next = self.spans.get(i).map_or(end, |(base, _)| end.min(*base));
+                let mut bytes = if next - at >= PAGE {
+                    pooled(next - at)
+                } else {
+                    Vec::with_capacity(next - at)
+                };
+                bytes.extend_from_slice(&source[at - start..next - start]);
+                self.spans.insert(i, (at, bytes));
+                at = next;
+            }
+            i += 1;
+        }
+    }
+
+    /// Copy-back asks only for declared bytes. Most 64 KiB comparisons lie
+    /// in a single span and borrow directly. Stitch a boundary piece only.
+    fn piece<'a>(&'a self, at: usize, len: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        let i = self.spans.partition_point(|(base, bytes)| base + bytes.len() <= at);
+        let (base, bytes) = &self.spans[i];
+        let tail = &bytes[at - base..];
+        if tail.len() >= len {
+            return &tail[..len];
+        }
+        scratch.clear();
+        scratch.extend_from_slice(tail);
+        for (base, bytes) in &self.spans[i + 1..] {
+            assert_eq!(*base, at + scratch.len());
+            let n = bytes.len().min(len - scratch.len());
+            scratch.extend_from_slice(&bytes[..n]);
+            if scratch.len() == len {
+                break;
+            }
+        }
+        assert_eq!(scratch.len(), len);
+        scratch
+    }
+
+    fn clear(&mut self) {
+        for (_, bytes) in self.spans.drain(..) {
+            if bytes.capacity() >= PAGE {
+                give_back(bytes);
+            }
+        }
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -65,8 +128,11 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Maximum bytes held idle in the snapshot pool across all buffers.
-const MAX_POOLED_BYTES: usize = 64 << 20;
+/// Maximum bytes held idle in the snapshot pool across all buffers: keeps at
+/// most 1 large buffer (up to 192 MiB, covering the title's 174 MiB world heap
+/// without per-frame VirtualAlloc/page-fault thrash) or up to 2 buffers within
+/// 192 MiB total.
+const MAX_POOLED_BYTES: usize = 192 << 20;
 
 /// Returns a snapshot buffer to the pool (at most 2 kept and at most
 /// [`MAX_POOLED_BYTES`] total, so large heaps do not pin ~1.4 GiB idle).
@@ -152,42 +218,19 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// Keep the first image of each declared byte until copy-back completes.
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-        let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
+        let range = (address, address + len);
         {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.contains(&range) {
+                pending.push(range);
             }
-            None => grown.extend_from_slice(host(start, end)),
         }
-        *before = Some((start, grown));
+        let (from, to) = self.inside(address, len);
+        // SAFETY: inside the persistent host mapping, before GPU execution.
+        let source = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+        self.before.lock().unwrap_or_else(|e| e.into_inner()).capture(from, source);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -202,12 +245,8 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        if from < to {
+            let mut boundary = Vec::new();
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -219,7 +258,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = snapshot.piece(at, n, &mut boundary);
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
@@ -261,10 +300,8 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
+        if pending.is_empty() {
+            snapshot.clear();
         }
         written
     }
@@ -506,4 +543,25 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_and_overlapping_declarations_keep_first_bytes() {
+        let mut s = Snapshot::default();
+        let mut scratch = Vec::new();
+        s.capture(1_000_000, &[9; 8]);
+        s.capture(5, &[1, 2, 3]);
+        s.capture(7, &[4, 5]);
+        s.capture(3, &[6; 7]);
+        assert_eq!(s.spans.iter().map(|(_, v)| v.len()).sum::<usize>(), 15);
+        assert_eq!(s.piece(3, 7, &mut scratch), &[6, 6, 1, 2, 3, 5, 6]);
+        assert_eq!(s.piece(1_000_002, 2, &mut scratch), &[9, 9]);
+        s.clear();
+        s.capture(5, &[7]);
+        assert_eq!(s.piece(5, 1, &mut scratch), &[7]);
+    }
 }

@@ -57,11 +57,21 @@ pub(crate) struct Host {
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     formats: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
-    /// Pooled 4 MiB upload chunks returned by reset command lists (capped).
+    /// Pooled 1 MiB upload chunks returned by reset command lists (capped).
     scratch_pool: Mutex<Vec<ScratchChunk>>,
-    /// Shared prelude command allocator/list, created lazily on first transition.
-    prelude: OnceLock<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
+    /// Shared prelude allocator and lazily grown command lists, reset per submission chunk.
+    prelude: Mutex<Option<PreludePool>>,
+    /// Adaptive command-list chunk size for `Host::execute` (1..=16).
+    chunk_size: AtomicU32,
 }
+
+struct PreludePool {
+    allocator: ID3D12CommandAllocator,
+    lists: Vec<ID3D12GraphicsCommandList>,
+}
+
+// SAFETY: only accessed while `Host::submitted` is held.
+unsafe impl Send for PreludePool {}
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
 // free-threaded; the event handle is only waited on under `submitted`.
@@ -266,7 +276,8 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             formats: Mutex::default(),
             scratch_pool: Mutex::default(),
-            prelude: OnceLock::new(),
+            prelude: Mutex::new(None),
+            chunk_size: AtomicU32::new(8),
         })
     }
 }
@@ -429,12 +440,10 @@ struct Scratch {
     used: u64,
 }
 
-const SCRATCH_CHUNK: u64 = 4 << 20;
-const SCRATCH_POOL_MAX: usize = 8;
+const SCRATCH_CHUNK: u64 = 1 << 20;
+const SCRATCH_POOL_MAX: usize = 32;
 
-/// Default-heap memory a list's mesh fallback draws write and read: per
-/// [`ScratchPool`], chunks handed out in order, each draw getting a region
-/// of its own (see [`HostList::mesh_scratch`]).
+/// Per-list buffers for ordered mesh fallback passes.
 #[derive(Default)]
 struct MeshScratch {
     pools: [Pool; 2],
@@ -450,68 +459,33 @@ pub(crate) enum ScratchPool {
     Commands = 1,
 }
 
-/// Chunks (buffer, size, bytes used since the reset, used as a UAV since the
-/// reset) and the chunk being filled.
+/// Each fallback draw consumes its output and transitions it back to UAV
+/// before the next draw. The same GPU address can then serve both draws.
+/// Older buffers are kept alive by the recorded draws until list reset.
 #[derive(Default)]
 struct Pool {
-    chunks: Vec<(ID3D12Resource, u64, u64, bool)>,
-    current: usize,
-}
-
-/// A mesh fallback chunk's size; bigger regions get a chunk of their own
-/// (a power of two, kept for later draws).
-const MESH_CHUNK: u64 = 64 << 20;
-
-/// A region of a list's mesh fallback memory.
-pub(crate) struct ScratchRegion {
-    pub(crate) buffer: ID3D12Resource,
-    /// Byte offset of the region in `buffer`.
-    pub(crate) offset: u64,
-    /// The list uses `buffer` for the first time since its reset: it is in
-    /// COMMON (new, or decayed after the list last ran) and must move to
-    /// UNORDERED_ACCESS first. Otherwise it is in UNORDERED_ACCESS.
-    pub(crate) first: bool,
+    buffer: Option<(ID3D12Resource, u64)>,
+    touched: bool,
 }
 
 impl Pool {
-    /// A region of at least `len` bytes; `make` makes a chunk of a size.
-    fn region(
+    fn acquire(
         &mut self,
         len: u64,
         make: impl FnOnce(u64) -> Option<ID3D12Resource>,
-    ) -> Option<ScratchRegion> {
-        let len = len.max(16).next_multiple_of(256);
-        // The chunk being filled, else the next one big enough (chunks past
-        // the current one are unused since the reset), else a new one.
-        let mut at = self.current;
-        while at < self.chunks.len() {
-            let (_, size, used, _) = &self.chunks[at];
-            if used + len <= *size {
-                break;
-            }
-            at += 1;
+    ) -> Option<(ID3D12Resource, bool)> {
+        if self.buffer.as_ref().is_none_or(|(_, size)| *size < len) {
+            // Committed D3D12 buffers have 64 KiB allocation granularity.
+            let size = len.max(64 << 10).checked_next_power_of_two()?;
+            self.buffer = Some((make(size)?, size));
+            self.touched = false;
         }
-        if at == self.chunks.len() {
-            let size = MESH_CHUNK.max(len.next_power_of_two());
-            self.chunks.push((make(size)?, size, 0, false));
-        }
-        self.current = at;
-        let (buffer, _, used, touched) = &mut self.chunks[at];
-        let region = ScratchRegion {
-            buffer: buffer.clone(),
-            offset: *used,
-            first: !*touched,
-        };
-        *used += len;
-        *touched = true;
-        Some(region)
+        let first = !std::mem::replace(&mut self.touched, true);
+        Some((self.buffer.as_ref()?.0.clone(), first))
     }
 
     fn reset(&mut self) {
-        for (_, _, used, touched) in &mut self.chunks {
-            (*used, *touched) = (0, false);
-        }
-        self.current = 0;
+        self.touched = false;
     }
 }
 
@@ -733,10 +707,14 @@ impl Host {
         drop(overflow);
     }
 
-    /// At submission: the shared list that moves each texture `list` uses
-    /// from its real state to the one `list` starts with; the textures' real
-    /// states become those `list` ends with.
-    fn prelude(&self, list: &HostList) -> Option<ID3D12CommandList> {
+    /// Records prelude transition barriers for `list` into the `slot`-th
+    /// shared prelude list (sharing one allocator reset once per chunk).
+    fn prelude_into(
+        &self,
+        pool: &mut Option<PreludePool>,
+        slot: &mut usize,
+        list: &HostList,
+    ) -> Option<ID3D12CommandList> {
         let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
@@ -754,29 +732,39 @@ impl Host {
         if barriers.is_empty() {
             return None;
         }
-        let (allocator, cmd) = self
-            .prelude
-            .get_or_init(|| {
+        let pool = match pool {
+            Some(p) => p,
+            None => {
                 // SAFETY: plain object creation.
-                unsafe {
-                    let allocator: ID3D12CommandAllocator = self
-                        .device
+                let allocator: ID3D12CommandAllocator = unsafe {
+                    self.device
                         .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                        .ok()?;
-                    let cmd: ID3D12GraphicsCommandList = self
-                        .device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
-                        .ok()?;
-                    cmd.Close().ok()?;
-                    Some((allocator, cmd))
-                }
-            })
-            .as_ref()?;
-        // SAFETY: the shared prelude is only used here while `self.submitted`
-        // is held and each previous submission's fence has completed.
+                        .ok()?
+                };
+                pool.insert(PreludePool {
+                    allocator,
+                    lists: Vec::new(),
+                })
+            }
+        };
+        if *slot == pool.lists.len() {
+            // SAFETY: plain object creation; closed before returning.
+            let cmd: ID3D12GraphicsCommandList = unsafe {
+                let cmd: ID3D12GraphicsCommandList = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &pool.allocator, None)
+                    .ok()?;
+                cmd.Close().ok()?;
+                cmd
+            };
+            pool.lists.push(cmd);
+        }
+        let cmd = &pool.lists[*slot];
+        *slot += 1;
+        // SAFETY: `pool.allocator` was reset before this chunk and only one
+        // prelude list records into it at a time.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                cmd.Reset(allocator, None)?;
+            cmd.Reset(&pool.allocator, None).and_then(|()| {
                 cmd.ResourceBarrier(&barriers);
                 cmd.Close()
             })
@@ -801,17 +789,39 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Submit each title list (with its prelude) in its own ExecuteCommandLists
-        // + fence wait so heavy 30+ list world submissions do not sum past
-        // Windows' ~2 s TDR timeout and trigger DXGI_ERROR_DEVICE_HUNG (0x887A0006).
-        for run in runs {
-            let mut group = Vec::with_capacity(2);
-            if let Some(prelude) = self.prelude(run) {
-                group.push(Some(prelude));
+        // Submit in adaptive chunks (default 8, 1..=16) so 30-50 list world
+        // submissions avoid per-list CPU<->GPU drain stalls while still
+        // staying well below Windows' ~2 s TDR timeout (auto-halving on >250 ms
+        // chunks; always 1 when per-list GPU timing is enabled).
+        let mut prelude_pool = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idx = 0;
+        while idx < runs.len() {
+            #[cfg(feature = "diagnostics")]
+            let step = if timing() {
+                1
+            } else {
+                (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, 16)
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let step = (self.chunk_size.load(Ordering::Relaxed) as usize).clamp(1, 16);
+            let end = (idx + step).min(runs.len());
+            let chunk = &runs[idx..end];
+            if let Some(pool) = prelude_pool.as_mut() {
+                // SAFETY: previous chunk waited for fence completion.
+                if let Err(e) = unsafe { pool.allocator.Reset() } {
+                    fail(format_args!("a host prelude allocator did not reset ({e})"));
+                }
             }
-            group.push(run.list.cast().ok());
+            let mut slot = 0;
+            let mut group = Vec::with_capacity(chunk.len() * 2);
+            for run in chunk {
+                if let Some(prelude) = self.prelude_into(&mut prelude_pool, &mut slot, run) {
+                    group.push(Some(prelude));
+                }
+                group.push(run.list.cast().ok());
+            }
             *submitted += 1;
-            let started = std::time::Instant::now();
+            let chunk_started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(&group);
@@ -826,22 +836,36 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            let chunk_elapsed = chunk_started.elapsed();
             #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && chunk.len() == 1 && chunk_elapsed > std::time::Duration::from_millis(50)
+            {
+                let run = chunk[0];
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                tracing::warn!(ms = chunk_elapsed.as_millis(), commands, "slow host list");
                 for (ms, op) in run.slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = started;
+            if chunk.len() > 1 && chunk_elapsed > std::time::Duration::from_millis(250) {
+                self.chunk_size
+                    .store((step / 2).max(1) as u32, Ordering::Relaxed);
+            } else if chunk.len() == step
+                && step < 16
+                && chunk_elapsed < std::time::Duration::from_millis(40)
+            {
+                self.chunk_size
+                    .store((step * 2).min(16) as u32, Ordering::Relaxed);
+            }
             // SAFETY: a plain query.
             if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 break;
             }
+            idx = end;
         }
+        drop(prelude_pool);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1366,23 +1390,27 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// A region of at least `len` bytes (256-byte aligned) of the list's
-    /// shader-writable mesh fallback memory in `pool`, for one draw, which no
-    /// other draw of the list gets until the list is reset.
-    ///
-    /// The chunks of a pool stay in UNORDERED_ACCESS between draws: the
-    /// draw moves its chunk out of it for its reads and back after them
-    /// (first from COMMON, when [`ScratchRegion::first`]). A chunk's
-    /// transitions cover the whole chunk; regions of earlier draws are only
-    /// read by those draws, which the transitions order before later writes.
-    /// After the list runs the chunks decay to COMMON, as buffers do.
-    pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ScratchRegion> {
+    /// A list-local buffer in UAV state. Keep it alive immediately: another
+    /// request may grow the pool even if this draw exits before dispatch.
+    pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ID3D12Resource> {
         let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        s.pools[pool as usize].region(len, |size| {
+        let (buffer, first) = s.pools[pool as usize].acquire(len, |size| {
             let buffer = host()?.uav_buffer(size)?;
             name(&buffer, || format!("mesh fallback {pool:?} {size:#x}"));
             Some(buffer)
-        })
+        })?;
+        if first {
+            self.keep(&buffer);
+            // SAFETY: an open list and a live buffer in COMMON.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )])
+            };
+        }
+        Some(buffer)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1489,8 +1517,9 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
+                    // The shaders start from the title's data; flush only this
+                    // buffer so other shadows' refreshes keep coalescing.
+                    batch.flush_shadow(shadow);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -1548,6 +1577,23 @@ impl Batch {
         self.textures.clear();
     }
 
+    fn flush_shadow(&mut self, target: &std::sync::Arc<crate::shadow::Shadow>) {
+        if let Some(pos) = self
+            .refreshes
+            .iter()
+            .position(|(s, ..)| std::sync::Arc::ptr_eq(s, target))
+        {
+            let (shadow, from, to) = self.refreshes.swap_remove(pos);
+            let started = std::time::Instant::now();
+            let copied = shadow.update(from, to - from);
+            let us = started.elapsed().as_micros() as u64;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::range(from, to - from, us, 0);
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+    }
+
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
@@ -1564,7 +1610,8 @@ impl Batch {
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// destination (`title_dst`) with an unmapped page is never written by
+/// the page retries. The initial kernel copy may write a mapped prefix.
 ///
 /// The source is read through the kernel (`ReadProcessMemory`), which
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
@@ -1581,7 +1628,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
@@ -1590,17 +1637,38 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let (whole, done) = read_partial(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
-    if whole {
+    // The page fallback writes zeros directly. Only use it if the entire
+    // title destination is mapped. The successful fast path needs no query.
+    if whole || title_dst && !crate::texture::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    let done = done.min(len);
+    // Something is unmapped at or after `src + done`: walk VirtualQuery regions
+    // for the remaining tail so large committed spans take one ReadProcessMemory
+    // each and unmapped holes are zeroed in one memset, falling back to
+    // 64 KiB -> 4 KiB pieces if a concurrent unmap races between VirtualQuery
+    // and ReadProcessMemory.
+    for_regions(src as usize + done, len - done, |at, n, committed| {
+        let to = dst.wrapping_add(at - src as usize);
+        if !committed {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+        } else if !read(at as *const u8, to, n) {
+            copy_pieces(dst, src, at, n);
+        }
+    });
+}
+
+/// Piece-by-piece fallback (64 KiB, then 4 KiB) for `[start, start + len)`.
+fn copy_pieces(dst: *mut u8, src: *const u8, start: usize, len: usize) {
+    for_pieces(start, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
@@ -1625,36 +1693,90 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_partial(src, dst, len).0
+}
+
+/// Copies up to `len` bytes from `src` to `dst`, returning `(ok, bytes_read)`.
+/// On a partial copy (`ok == false`), the first `bytes_read` bytes are already
+/// written into `dst`.
+fn read_partial(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+    };
+    (ok, done)
 }
 
-/// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// Copies GPU results to writable title pages. The caller opens any
+/// write-watch guards first. Uses `read_partial` (`ReadProcessMemory`) so
+/// read-only title pages are never overwritten, with `VirtualQuery` region
+/// skipping on holes.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+    let write_partial = |at: usize, n: usize| {
+        read_partial(src.wrapping_add(at - dst as usize), at as *mut u8, n)
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+    let (ok, done) = write_partial(dst as usize, len);
+    if ok {
+        return;
+    }
+    let done = done.min(len);
+    for_regions(dst as usize + done, len - done, |at, n, committed| {
+        if committed && !write_partial(at, n).0 {
+            for_pieces(at, n, 64 << 10, |at, n| {
+                if !write_partial(at, n).0 {
+                    for_pieces(at, n, 4 << 10, |at, n| {
+                        write_partial(at, n);
+                    });
+                }
             });
         }
     });
+}
+
+/// Walks `[start, start + len)` in `VirtualQuery` regions, passing `(at, n,
+/// committed)` where `committed` is true for `MEM_COMMIT` regions that are
+/// neither `PAGE_NOACCESS` nor `PAGE_GUARD`.
+fn for_regions(start: usize, len: usize, mut f: impl FnMut(usize, usize, bool)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        let mut mbi = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+        // SAFETY: `mbi` has the exact size `VirtualQuery` expects.
+        let queried = unsafe {
+            VirtualQuery(
+                at as *const _,
+                mbi.as_mut_ptr(),
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            f(at, end - at, true);
+            break;
+        }
+        // SAFETY: `VirtualQuery` returned non-zero, initializing `mbi`.
+        let mbi = unsafe { mbi.assume_init() };
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= at {
+            f(at, end - at, true);
+            break;
+        }
+        let next = region_end.min(end);
+        let committed = mbi.State == MEM_COMMIT
+            && (mbi.Protect & PAGE_GUARD) == 0
+            && (mbi.Protect & 0xff) != PAGE_NOACCESS;
+        f(at, next - at, committed);
+        at = next;
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -1666,6 +1788,41 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+#[cfg(test)]
+mod title_transfer_tests {
+    use super::{copy_mapped, write_mapped};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    #[test]
+    fn kernel_copies_handle_holes_and_protection() {
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: reserve our own three blocks and commit the first and last.
+        unsafe {
+            let dst = VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!dst.is_null());
+            let last = dst.add(2 * BLOCK);
+            for page in [dst, last] {
+                assert!(!VirtualAlloc(page.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            }
+            let src = vec![13u8; 3 * BLOCK];
+            copy_mapped(dst, src.as_ptr(), 3 * BLOCK, true);
+            assert_eq!(last.read(), 0);
+            copy_mapped(dst, src.as_ptr(), BLOCK, true);
+            assert_eq!(dst.read(), 13);
+            write_mapped(dst, src.as_ptr(), 3 * BLOCK);
+            assert_eq!(last.read(), 13);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(last.cast(), BLOCK, PAGE_READONLY, &mut old), 0);
+            write_mapped(last, [42u8].as_ptr(), 1);
+            assert_eq!(last.read(), 13);
+            assert_ne!(VirtualFree(dst.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }
 
@@ -2751,7 +2908,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         };
         let list = host.new_list().expect("host list");
         let (gpu1, _) = list.scratch(1024).expect("first scratch chunk");
-        assert!(host.prelude(&list).is_none());
+        {
+            let mut pool = host.prelude.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slot = 0;
+            assert!(host.prelude_into(&mut pool, &mut slot, &list).is_none());
+        }
         list.close();
         list.reset();
         let pooled = host.scratch_pool.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -2771,11 +2932,62 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let pooled = host.scratch_pool.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(pooled, super::SCRATCH_POOL_MAX);
     }
+
+    /// `copy_mapped` and `write_mapped` handle committed regions interleaved
+    /// with reserved (unmapped) holes: committed bytes round-trip and holes
+    /// read as zero / are skipped on write.
+    #[test]
+    fn copy_mapped_and_write_mapped_handle_holes_across_regions() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const TOTAL: usize = 2 << 20;
+        const CHUNK: usize = 512 << 10;
+        // SAFETY: reserving a 2 MiB private virtual range.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let base = base.cast::<u8>();
+        // SAFETY: committing two 512 KiB slices at 0 and 1 MiB and filling them.
+        unsafe {
+            assert!(!VirtualAlloc(base.cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(
+                !VirtualAlloc(base.add(2 * CHUNK).cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE)
+                    .is_null()
+            );
+            base.write_bytes(0x3C, CHUNK);
+            base.add(2 * CHUNK).write_bytes(0x5A, CHUNK);
+        }
+
+        // Pre-dirty destination so we verify holes are explicitly zeroed.
+        let mut dst = vec![0xAAu8; TOTAL];
+        super::copy_mapped(dst.as_mut_ptr(), base, TOTAL, false);
+        assert!(dst[..CHUNK].iter().all(|&b| b == 0x3C));
+        assert!(dst[CHUNK..2 * CHUNK].iter().all(|&b| b == 0));
+        assert!(dst[2 * CHUNK..3 * CHUNK].iter().all(|&b| b == 0x5A));
+        assert!(dst[3 * CHUNK..].iter().all(|&b| b == 0));
+
+        // write_mapped writes both committed regions and skips both holes.
+        let mut src = vec![0xEEu8; TOTAL];
+        src[..CHUNK].fill(0x71);
+        src[2 * CHUNK..3 * CHUNK].fill(0x92);
+        super::write_mapped(base, src.as_ptr(), TOTAL);
+        // SAFETY: both slices are committed and readable; then release the reservation.
+        unsafe {
+            assert!(std::slice::from_raw_parts(base, CHUNK).iter().all(|&b| b == 0x71));
+            assert!(
+                std::slice::from_raw_parts(base.add(2 * CHUNK), CHUNK)
+                    .iter()
+                    .all(|&b| b == 0x92)
+            );
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
 }
 
 #[cfg(test)]
 mod mesh_scratch {
-    use super::{MESH_CHUNK, Pool};
+    use super::Pool;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::Interface;
@@ -2815,7 +3027,7 @@ mod mesh_scratch {
     }
 
     #[test]
-    fn draws_get_their_own_regions_and_chunks_come_back_after_a_reset() {
+    fn ordered_draws_reuse_a_buffer_and_growth_preserves_first_use() {
         let mut device: Option<ID3D12Device> = None;
         // SAFETY: a plain device creation with a valid out pointer.
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
@@ -2825,34 +3037,31 @@ mod mesh_scratch {
         let device = device.unwrap();
         let mut made = Vec::new();
         let mut pool = Pool::default();
-        let mut region = |pool: &mut Pool, len| {
-            pool.region(len, |size| {
+        let mut acquire = |pool: &mut Pool, len| {
+            pool.acquire(len, |size| {
                 made.push(size);
                 Some(buffer(&device))
-            })
-            .unwrap()
+            }).unwrap()
         };
-        let same = |a: &super::ScratchRegion, b: &super::ScratchRegion| {
-            a.buffer.as_raw() == b.buffer.as_raw()
-        };
-        let a = region(&mut pool, 1000);
-        let b = region(&mut pool, 300);
-        assert_eq!((a.offset, a.first), (0, true));
-        // 256-byte aligned after the first; the chunk is already a UAV.
-        assert_eq!((b.offset, b.first), (1024, false));
-        assert!(same(&a, &b));
-        // Bigger than a chunk: one of its own, a power of two.
-        let big = region(&mut pool, 100 << 20);
-        assert_eq!((big.offset, big.first), (0, true));
-        assert!(!same(&a, &big));
-        let after = region(&mut pool, 10);
-        assert_eq!((after.offset, after.first), (100 << 20, false));
-        // After a reset the first chunk serves again, from COMMON.
+        let (a, first) = acquire(&mut pool, 300);
+        assert!(first);
+        let (b, first) = acquire(&mut pool, 1000);
+        assert!(!first);
+        assert_eq!(a.as_raw(), b.as_raw());
+        let (large, first) = acquire(&mut pool, 32 << 20);
+        assert!(first);
+        assert_ne!(a.as_raw(), large.as_raw());
+        assert!(pool.acquire(64 << 20, |_| None).is_none());
+        for _ in 0..1000 {
+            let (same, first) = acquire(&mut pool, 32 << 20);
+            assert_eq!(large.as_raw(), same.as_raw());
+            assert!(!first);
+        }
         pool.reset();
-        let again = region(&mut pool, 10);
-        assert_eq!((again.offset, again.first), (0, true));
-        assert!(same(&a, &again));
-        assert_eq!(made, [MESH_CHUNK, 128 << 20]);
+        let (same, first) = acquire(&mut pool, 10);
+        assert_eq!(large.as_raw(), same.as_raw());
+        assert!(first);
+        assert_eq!(made, [64 << 10, 32 << 20]);
     }
 }
 
