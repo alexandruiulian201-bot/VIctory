@@ -54,6 +54,10 @@ pub(crate) struct Host {
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     formats: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
+    /// Pooled 4 MiB upload chunks returned by reset command lists (capped).
+    scratch_pool: Mutex<Vec<ScratchChunk>>,
+    /// Shared prelude command allocator/list, created lazily on first transition.
+    prelude: OnceLock<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -224,6 +228,8 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             formats: Mutex::default(),
+            scratch_pool: Mutex::default(),
+            prelude: OnceLock::new(),
         })
     }
 }
@@ -299,8 +305,6 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
-    /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -358,19 +362,27 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
+struct ScratchChunk {
+    /// Kept alive for the lifetime of the persistently mapped pointer.
+    _buffer: ID3D12Resource,
+    cpu: usize,
+    gpu: u64,
+}
+
+// SAFETY: the chunk pointer is a persistent mapping of an upload buffer.
+unsafe impl Send for ScratchChunk {}
+
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
 }
 
-// SAFETY: the chunk pointers are persistent mappings of upload buffers.
-unsafe impl Send for Scratch {}
-
 const SCRATCH_CHUNK: u64 = 4 << 20;
+const SCRATCH_POOL_MAX: usize = 8;
 
 /// Default-heap memory a list's mesh fallback draws write and read: per
 /// [`ScratchPool`], chunks handed out in order, each draw getting a region
@@ -593,16 +605,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             Ok(HostList {
                 allocator,
                 list,
@@ -610,7 +612,6 @@ impl Host {
                 scratch: Mutex::default(),
                 mesh_scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -621,6 +622,93 @@ impl Host {
         }
     }
 
+    /// Takes a cached 4 MiB upload chunk from the shared pool or allocates one.
+    fn take_scratch(&self) -> Option<ScratchChunk> {
+        if let Some(chunk) = self
+            .scratch_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+        {
+            return Some(chunk);
+        }
+        let (buffer, data) = self.upload_buffer(SCRATCH_CHUNK)?;
+        name(&buffer, || "list scratch".into());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(ScratchChunk {
+            _buffer: buffer,
+            cpu: data as usize,
+            gpu,
+        })
+    }
+
+    /// Returns freed 4 MiB scratch chunks to the pool up to `SCRATCH_POOL_MAX`.
+    fn return_scratch(&self, chunks: Vec<ScratchChunk>) {
+        let overflow: Vec<ScratchChunk> = {
+            let mut pool = self.scratch_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let space = SCRATCH_POOL_MAX.saturating_sub(pool.len());
+            let mut it = chunks.into_iter();
+            pool.extend(it.by_ref().take(space));
+            it.collect()
+        };
+        drop(overflow);
+    }
+
+    /// At submission: the shared list that moves each texture `list` uses
+    /// from its real state to the one `list` starts with; the textures' real
+    /// states become those `list` ends with.
+    fn prelude(&self, list: &HostList) -> Option<ID3D12CommandList> {
+        let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+            .values()
+            .filter_map(|(first, last, copy)| {
+                let real = copy.state.swap(*last, Ordering::Relaxed);
+                (real != *first).then(|| {
+                    transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATES(*first as i32),
+                    )
+                })
+            })
+            .collect();
+        if barriers.is_empty() {
+            return None;
+        }
+        let (allocator, cmd) = self
+            .prelude
+            .get_or_init(|| {
+                // SAFETY: plain object creation.
+                unsafe {
+                    let allocator: ID3D12CommandAllocator = self
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .ok()?;
+                    let cmd: ID3D12GraphicsCommandList = self
+                        .device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                        .ok()?;
+                    cmd.Close().ok()?;
+                    Some((allocator, cmd))
+                }
+            })
+            .as_ref()?;
+        // SAFETY: the shared prelude is only used here while `self.submitted`
+        // is held and each previous submission's fence has completed.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                cmd.Reset(allocator, None)?;
+                cmd.ResourceBarrier(&barriers);
+                cmd.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("a host state prelude did not record ({e})"));
+        }
+        cmd.cast().ok()
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -629,34 +717,26 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
         // Submit each title list (with its prelude) in its own ExecuteCommandLists
         // + fence wait so heavy 30+ list world submissions do not sum past
         // Windows' ~2 s TDR timeout and trigger DXGI_ERROR_DEVICE_HUNG (0x887A0006).
-        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
-            .iter()
-            .zip(firsts.iter().skip(1).chain([&lists.len()]))
-            .map(|(&a, &b)| &lists[a..b])
-            .collect();
-        for (i, group) in groups.iter().enumerate() {
+        for run in runs {
+            let mut group = Vec::with_capacity(2);
+            if let Some(prelude) = self.prelude(run) {
+                group.push(Some(prelude));
+            }
+            group.push(run.list.cast().ok());
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue.ExecuteCommandLists(&group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -672,13 +752,13 @@ impl Host {
             if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (ms, op) in run.slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
+            let _ = started;
             // SAFETY: a plain query.
             if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 break;
@@ -1015,9 +1095,15 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
+        let drained = {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+            std::mem::take(&mut scratch.chunks)
+        };
+        if !drained.is_empty()
+            && let Some(host) = host()
+        {
+            host.return_scratch(drained);
         }
         self.mesh_scratch
             .lock()
@@ -1059,43 +1145,6 @@ impl HostList {
                 (before != wanted).then_some((texture, before))
             }
         }
-    }
-
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
-        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
-        if barriers.is_empty() {
-            return None;
-        }
-        let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
-        }
-        list.cast().ok()
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -1230,14 +1279,10 @@ impl HostList {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            s.chunks.push(host.take_scratch()?);
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let ScratchChunk { cpu: data, gpu, .. } = s.chunks[s.current];
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
@@ -2246,6 +2291,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn scratch_chunks_pool_and_cap_on_reset() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let (gpu1, _) = list.scratch(1024).expect("first scratch chunk");
+        assert!(host.prelude(&list).is_none());
+        list.close();
+        list.reset();
+        let pooled = host.scratch_pool.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!((1..=super::SCRATCH_POOL_MAX).contains(&pooled));
+
+        let (gpu2, _) = list.scratch(1024).expect("reused scratch chunk");
+        assert_eq!(gpu1, gpu2, "reset should return chunk to the shared pool");
+        list.close();
+        list.reset();
+
+        // Exceed SCRATCH_POOL_MAX in one list and confirm reset caps the pool.
+        for _ in 0..super::SCRATCH_POOL_MAX + 2 {
+            let _ = list.scratch(super::SCRATCH_CHUNK).expect("scratch chunk");
+        }
+        list.close();
+        list.reset();
+        let pooled = host.scratch_pool.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(pooled, super::SCRATCH_POOL_MAX);
     }
 }
 
