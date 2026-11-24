@@ -1316,8 +1316,7 @@ impl State {
             return ran;
         }
         let ran = match kind {
-            DRAW => self.prepare(list, false),
-            INDEXED => self.topology != RECTANGLES && self.prepare(list, true),
+            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
