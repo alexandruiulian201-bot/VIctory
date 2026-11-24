@@ -66,9 +66,9 @@ fn pooled(n: usize) -> Vec<u8> {
 }
 
 /// Maximum bytes held idle in the snapshot pool across all buffers.
-const MAX_POOLED_BYTES: usize = 256 << 20;
+const MAX_POOLED_BYTES: usize = 64 << 20;
 
-/// Returns a snapshot buffer to the pool (at most 4 kept and at most
+/// Returns a snapshot buffer to the pool (at most 2 kept and at most
 /// [`MAX_POOLED_BYTES`] total, so large heaps do not pin ~1.4 GiB idle).
 fn give_back(v: Vec<u8>) {
     if v.capacity() > MAX_POOLED_BYTES {
@@ -77,7 +77,7 @@ fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(4);
+    pool.truncate(2);
     let mut total: usize = pool.iter().map(Vec::capacity).sum();
     while total > MAX_POOLED_BYTES {
         let Some(dropped) = pool.pop() else { break };
