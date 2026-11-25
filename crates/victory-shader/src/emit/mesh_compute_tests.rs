@@ -183,6 +183,7 @@ fn shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
         view_addresses: false,
         heap: false,
         heap_writes: false,
+        view_marks: false,
     }
 }
 
@@ -214,6 +215,7 @@ fn lowered_with_max_primitives(
     let outputs = outputs();
     let l = lower::lower_with(
         &lower::Parts {
+            view_marks: false,
             native: &native,
             p: &p,
             st: &st,
@@ -1012,6 +1014,7 @@ fn bench_lowered() -> (HostShader, MeshLayout) {
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower_with(
         &lower::Parts {
+            view_marks: false,
             native: &native,
             p: &p,
             st: &st,

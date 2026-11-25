@@ -1635,6 +1635,7 @@ fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower_with(
         &lower::Parts {
+            view_marks: false,
             native: &native,
             p: &p,
             st: &st,
@@ -1664,6 +1665,7 @@ fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -1754,6 +1756,7 @@ fn run_wave64_on_wave32(
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower_with(
         &lower::Parts {
+            view_marks: false,
             native: &native,
             p: &p,
             st: &st,
@@ -1784,6 +1787,7 @@ fn run_wave64_on_wave32(
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
