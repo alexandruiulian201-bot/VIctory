@@ -847,7 +847,9 @@ fn plan_uniform_branches(
                 None
             };
             let Some(kind) = kind else {
-                return None;
+                // The dominance check above can also select unrelated branches.
+                // Try the remaining candidates before declaring the plan impossible.
+                continue;
             };
             plan.insert(br, kind);
             ignored.insert(br);
