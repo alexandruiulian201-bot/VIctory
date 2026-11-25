@@ -638,10 +638,12 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Diagnostic (NVIDIA heap cap): log once per 64 Ki-slot band past
+            // the host heap so sequential heap initialization does not flood stderr.
+            static HIGHEST_BAND: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let band = (index >> 16) + 1;
+            if HIGHEST_BAND.fetch_max(band, std::sync::atomic::Ordering::Relaxed) < band {
                 tracing::warn!(
                     index,
                     count = self.count,
