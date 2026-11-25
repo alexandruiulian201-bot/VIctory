@@ -177,6 +177,12 @@ fn shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
+        heap: false,
+        heap_writes: false,
     }
 }
 
@@ -206,19 +212,22 @@ fn lowered_with_max_primitives(
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let outputs = outputs();
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: outputs.clone(),
-        prims: prim_outputs(prims),
-        mesh_stride: max_primitives,
-        mesh_as_compute: as_compute,
-        max_wave: 64,
-    })
+    let l = lower::lower_with(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: outputs.clone(),
+            prims: prim_outputs(prims),
+            mesh_stride: max_primitives,
+        },
+        as_compute,
+        64,
+        super::HEAP_VIEWS,
+    )
     .expect("lower");
     let s = shader(HwStage::Ms, l.dxil);
     validate(&s);
@@ -1001,19 +1010,22 @@ fn bench_lowered() -> (HostShader, MeshLayout) {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: outputs(),
-        prims: Vec::new(),
-        mesh_stride: 32,
-        mesh_as_compute: true,
-        max_wave: 64,
-    })
+    let l = lower::lower_with(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: outputs(),
+            prims: Vec::new(),
+            mesh_stride: 32,
+        },
+        true,
+        64,
+        super::HEAP_VIEWS,
+    )
     .expect("lower");
     let s = shader(HwStage::Ms, l.dxil);
     validate(&s);
