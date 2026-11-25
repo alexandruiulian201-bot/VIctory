@@ -673,6 +673,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            name(&list, || format!("VIctory list {:p}", list.as_raw()));
             Ok(HostList {
                 allocator,
                 list,
@@ -1118,13 +1119,25 @@ impl Host {
                     return text;
                 }
             };
+            // With the debug layer the breadcrumb can refer to an underlying
+            // command list instead of the interface we recorded through.
+            let list_index = |p: &D3D12_AUTO_BREADCRUMB_NODE| {
+                let raw = p.pCommandList.as_ref().map(|l| l.as_raw());
+                runs.iter().position(|r| Some(r.list.as_raw()) == raw).or_else(|| {
+                    if p.pCommandListDebugNameW.is_null() {
+                        return None;
+                    }
+                    let name = p.pCommandListDebugNameW.to_string().ok()?;
+                    let address = usize::from_str_radix(name.strip_prefix("VIctory list 0x")?, 16).ok()?;
+                    runs.iter().position(|r| r.list.as_raw() as usize == address)
+                })
+            };
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let index = list_index(p);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -1139,8 +1152,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = list_index(p).map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
