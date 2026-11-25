@@ -15,7 +15,7 @@
 //! how much that frees.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Dynamic slots: the title heap they belong to (its address), the first
@@ -28,6 +28,9 @@ pub(crate) struct Lease {
     ranges: Mutex<Vec<Range>>,
     /// The slots were taken back after the list ran.
     lost: AtomicBool,
+    /// Queued or executed segments currently holding these slots between
+    /// [`Lease::start`] and [`Lease::finish`].
+    active: AtomicU32,
 }
 
 /// The leases of lists that ran, oldest first, and that still hold slots.
@@ -73,21 +76,31 @@ impl Lease {
             .any(|r| r.0 == heap)
     }
 
-    /// Before the list is submitted: false if its slots were taken back
-    /// (it must not run); else it cannot be taken back until
-    /// [`Lease::finish`].
+    /// Before a segment of the list is queued/submitted: false if its slots
+    /// were taken back (it must not run); else it cannot be taken back until
+    /// every started segment calls [`Lease::finish`].
     pub(crate) fn start(self: &Arc<Self>) -> bool {
         let mut queue = finished_queue();
         if self.is_lost() {
             return false;
         }
+        self.active.fetch_add(1, Ordering::Relaxed);
         queue.retain(|l| !Arc::ptr_eq(l, self));
         true
     }
 
-    /// After the list ran: its slots may be taken back if a heap runs short.
+    /// After a segment ran: once every started segment has finished, its
+    /// slots may be taken back if a heap runs short.
     pub(crate) fn finish(self: &Arc<Self>) {
-        if self.is_lost()
+        let mut queue = finished_queue();
+        let left = self
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .map_or(0, |n| n.saturating_sub(1));
+        if left > 0
+            || self.is_lost()
             || self
                 .ranges
                 .lock()
@@ -96,7 +109,6 @@ impl Lease {
         {
             return;
         }
-        let mut queue = finished_queue();
         queue.retain(|l| !Arc::ptr_eq(l, self));
         queue.push_back(self.clone());
         // Lists that were reset hold nothing and only take room here.
