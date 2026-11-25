@@ -101,8 +101,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let max_wave = crate::host::host().map_or(64, crate::host::Host::max_wave_size);
     let heap_views =
         crate::host::host().map_or(victory_shader::emit::HEAP_VIEWS, crate::host::Host::heap_views);
+    // Writes through views mark their pages: copy-backs compare only those
+    // (`crate::shadow::copy_back_marks`).
+    let options = victory_shader::emit::Options { view_marks: true };
     let translate = move |c: &[u8]| {
-        victory_shader::emit::translate_for_host(c, max_wave, heap_views)
+        victory_shader::emit::translate_for_host_with(c, max_wave, heap_views, options)
             .map_err(|e| e.to_string())
     };
     match CACHE.get() {
@@ -294,6 +297,7 @@ fn encode_shader(s: &HostShader) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        view_marks,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -342,7 +346,8 @@ fn encode_shader(s: &HostShader) -> Vec<u8> {
             | u32::from(*memory_writes) << 1
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
-            | u32::from(*heap_writes) << 4,
+            | u32::from(*heap_writes) << 4
+            | u32::from(*view_marks) << 5,
     );
     out
 }
@@ -419,6 +424,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        view_marks: memory & 32 != 0,
     }))
 }
 
@@ -518,6 +524,7 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            view_marks: true,
         }
     }
 

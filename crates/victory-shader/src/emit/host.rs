@@ -63,6 +63,35 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The first adapter that is a GPU: not flagged software, and with video
+/// memory of its own. A machine without one (GitHub's Windows runner has only
+/// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
+/// checks on, and CI proved that the flag of adapter 0 alone is not enough:
+/// the runner's default adapter is not flagged software and its device still
+/// refuses a wave of 32
+/// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
+/// basic render driver report no dedicated video memory, which is what this
+/// asks for as well.
+fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let desc = adapter.GetDesc1()?;
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if !software && desc.DedicatedVideoMemory > 0 {
+                return Ok(adapter);
+            }
+        }
+    }
+    Err(windows::core::Error::new(
+        windows::Win32::Foundation::E_FAIL,
+        "no hardware adapter",
+    ))
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     /// A software default adapter (a machine without a GPU, as CI) is
@@ -85,24 +114,7 @@ impl Host {
             let adapter: IDXGIAdapter1 = if warp {
                 factory.EnumWarpAdapter().map_err(err)?
             } else {
-                let high_perf = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
-                    .ok()
-                    .and_then(|f| {
-                        f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
-                            0,
-                            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                        )
-                        .ok()
-                    });
-                let adapter = match high_perf {
-                    Some(adapter) => adapter,
-                    None => factory.EnumAdapters1(0).map_err(err)?,
-                };
-                if adapter.GetDesc1().map_err(err)?.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-                {
-                    return Err("no hardware adapter".into());
-                }
-                adapter
+                hardware_adapter(&factory).map_err(err)?
             };
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
@@ -247,6 +259,10 @@ impl Host {
         }
         if stages.iter().any(|(s, _)| s.view_addresses) {
             views.push((1, super::MEMORY_SPACE, 1));
+        }
+        if stages.iter().any(|(s, _)| s.view_marks) {
+            views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
+            views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
         }
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
@@ -803,6 +819,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -818,6 +835,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 
@@ -916,6 +934,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         view_addresses: false,
         heap: false,
         heap_writes: false,
+        view_marks: false,
     }
 }
 

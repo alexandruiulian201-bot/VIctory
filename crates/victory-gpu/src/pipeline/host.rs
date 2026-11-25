@@ -322,6 +322,10 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Our root parameters of the view-mark table and the buffer views'
+    /// written-pages bitmap, if a stage marks its writes through views
+    /// (`victory_shader::emit`, "Write marks").
+    pub(crate) marks: Option<(u32, u32)>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -541,6 +545,33 @@ impl HostPipeline {
             }
             Some(stage)
         };
+        let add_marks = |params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+                         slice: &[(&Arc<Shader>, D3D12_SHADER_VISIBILITY)]| {
+            // One pair for all stages: they share the heap and the bitmap.
+            slice
+                .iter()
+                .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_marks))
+                .then(|| {
+                    let first = params.len() as u32;
+                    for (kind, register) in [
+                        (D3D12_ROOT_PARAMETER_TYPE_SRV, victory_shader::emit::VIEW_MARKS),
+                        (D3D12_ROOT_PARAMETER_TYPE_UAV, victory_shader::emit::VIEW_WRITES),
+                    ] {
+                        params.push(D3D12_ROOT_PARAMETER1 {
+                            ParameterType: kind,
+                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                    ShaderRegister: register,
+                                    RegisterSpace: MEMORY_SPACE,
+                                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                                },
+                            },
+                            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                        });
+                    }
+                    (first, first + 1)
+                })
+        };
 
         // The root signature(s) the translated shaders' bindings define.
         // Mesh fallback uses a dedicated compute root signature for the mesh
@@ -548,7 +579,7 @@ impl HostPipeline {
         // for the pixel stage (`VISIBILITY_PIXEL` + `t0`-`t2`), avoiding
         // register-space overlap between `ALL` and `PIXEL` bindings.
         let mut bound = Vec::new();
-        let (root, root_blob, fallback_roots) = if fallback.is_some() {
+        let (root, root_blob, fallback_roots, marks) = if fallback.is_some() {
             let mut cs_params = Vec::new();
             let mut cs_samplers = Vec::new();
             let (ms_shader, ms_vis) = &stages[0];
@@ -610,6 +641,7 @@ impl HostPipeline {
             for &(shader, visibility) in &stages[1..] {
                 bound.push(add_stage(shader, visibility, &mut gfx_params, &mut gfx_samplers)?);
             }
+            let gfx_marks = add_marks(&mut gfx_params, &stages[1..]);
             let in_first = gfx_params.len() as u32;
             for register in 0..3 {
                 gfx_params.push(D3D12_ROOT_PARAMETER1 {
@@ -641,6 +673,7 @@ impl HostPipeline {
                     [out_first, out_first + 1, out_first + 2],
                     [in_first, in_first + 1, in_first + 2],
                 )),
+                gfx_marks,
             )
         } else {
             let mut params = Vec::new();
@@ -648,6 +681,7 @@ impl HostPipeline {
             for &(shader, visibility) in &stages {
                 bound.push(add_stage(shader, visibility, &mut params, &mut samplers)?);
             }
+            let marks = add_marks(&mut params, &stages);
             let (root, root_blob) =
                 match root_signature(&host.device, &params, &samplers, compute.is_some()) {
                     Ok(root) => root,
@@ -656,7 +690,7 @@ impl HostPipeline {
                         return None;
                     }
                 };
-            (root, root_blob, None)
+            (root, root_blob, None, marks)
         };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
@@ -703,6 +737,7 @@ impl HostPipeline {
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
+                marks,
             });
         }
         let Some(g) = g else {
@@ -815,6 +850,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rectangles: false,
+                marks,
             });
         }
         if mesh.is_some() {
@@ -845,6 +881,7 @@ impl HostPipeline {
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
+                marks,
             });
         }
 
@@ -930,6 +967,7 @@ impl HostPipeline {
             rectangles: !gs.is_empty(),
             slots: g.slots(),
             inputs: g.elements(),
+            marks,
         })
     }
 }

@@ -221,10 +221,18 @@ pub(crate) fn early(p: &Arc<Pending>) {
 fn wait(p: &Pending, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
+    static FRAME_BUDGET: OnceLock<Duration> = OnceLock::new();
+    let budget = *FRAME_BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(BUDGET)
+    });
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -264,8 +272,7 @@ fn worker_count() -> usize {
         (GlobalMemoryStatusEx(&mut mem) != 0).then_some(mem.ullTotalPhys)
     };
     match total_phys {
-        Some(bytes) if bytes <= 14 << 30 => 2,
-        Some(bytes) if bytes <= 18 << 30 => if cores >= 8 { 3 } else { 2 },
+        Some(bytes) if bytes <= 18 << 30 => 2,
         Some(bytes) if bytes <= 26 << 30 => (cores / 2).clamp(2, 4),
         Some(_) => (cores / 2).clamp(2, 8),
         None => 2,
