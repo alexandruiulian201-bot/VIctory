@@ -2373,12 +2373,13 @@ impl Batch {
     }
 
     fn flush_shadow(&mut self, target: &std::sync::Arc<crate::shadow::Shadow>) {
-        if let Some(pos) = self
-            .refreshes
-            .iter()
-            .position(|(s, ..)| std::sync::Arc::ptr_eq(s, target))
-        {
+        let key = std::sync::Arc::as_ptr(target) as usize;
+        if let Some(pos) = self.pending.remove(&key) {
             let (shadow, from, to) = self.refreshes.swap_remove(pos);
+            if let Some((swapped, ..)) = self.refreshes.get(pos) {
+                self.pending
+                    .insert(std::sync::Arc::as_ptr(swapped) as usize, pos);
+            }
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -2386,6 +2387,12 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
+            if from <= *b && *a <= to {
+                (*a, *b) = ((*a).min(from), (*b).max(to));
+            } else if to - from > *b - *a {
+                (*a, *b) = (from, to);
+            }
         }
     }
 
