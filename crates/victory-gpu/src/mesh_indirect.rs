@@ -61,18 +61,25 @@ void main() {
     // Groups of the records so far: where the next record's output starts.
     uint used = 0;
     for (uint i = 0; i < records; i++) {
-        uint g = i < n ? args.Load(i * stride) : 0u;
+        uint g = 0;
+        if (i < n) {
+            uint3 groups = args.Load3(i * stride);
+            if (groups.y && groups.z) g = groups.x;
+        }
         if (g > capacity - used) {
             g = 0;
         }
+        // Empty commands still bind root descriptors. When the last group
+        // filled the buffer, its successor would point beyond the region.
+        uint group_offset = used < capacity ? used : 0;
         uint c = i * 40;
-        commands.Store2(c, at(vertices, used * vertex_bytes));
-        commands.Store2(c + 8, at(indices, used * primitives * 12));
-        commands.Store2(c + 16, at(prims, used * prim_bytes));
+        commands.Store2(c, at(vertices, group_offset * vertex_bytes));
+        commands.Store2(c + 8, at(indices, group_offset * primitives * 12));
+        commands.Store2(c + 16, at(prims, group_offset * prim_bytes));
         commands.Store3(c + 24, uint3(g, 1, 1));
         uint first = used * primitives * 3;
         uint d = draws + i * (expanded != 0 ? 24 : 32);
-        commands.Store2(d, at(vertices, used * vertex_bytes));
+        commands.Store2(d, at(vertices, group_offset * vertex_bytes));
         // Count, one instance, first index or vertex, then a base vertex
         // and first instance of 0 (indexed) or a first instance of 0.
         commands.Store4(d + 8, uint4(primitives * 3 * g, 1, first, 0));

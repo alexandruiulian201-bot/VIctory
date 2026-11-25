@@ -804,6 +804,7 @@ impl State {
             unsafe {
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("indirect mesh {records} as compute"), false));
+                list.keep(&signatures.compute);
                 l.ExecuteIndirect(
                     &signatures.compute,
                     records,
@@ -836,6 +837,7 @@ impl State {
                     }
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("indirect mesh {records} drawn"), false));
+                    list.keep(&signatures.draw);
                     l.ExecuteIndirect(
                         &signatures.draw,
                         records,

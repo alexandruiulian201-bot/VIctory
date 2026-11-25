@@ -189,7 +189,7 @@ fn layout(primitive_dwords: u32) -> victory_shader::emit::MeshLayout {
     }
 }
 
-/// Three records of 2, 0 and 5 groups (12-byte records, 16 bytes apart);
+/// Five padded records, including an empty dispatch along each axis;
 /// the count says the first two only, or all of them without a count.
 fn check(expanded: bool, count: Option<u32>) {
     let Some(device) = device() else {
@@ -199,9 +199,9 @@ fn check(expanded: bool, count: Option<u32>) {
     let layout = layout(if expanded { 4 } else { 0 });
     let regions = regions(&layout);
     let data = 0x1_0000_0000u64;
-    let records = 3;
+    let records = 5;
     let draws = records * COMPUTE_STRIDE;
-    let args = [2, 1, 1, 0, 0, 1, 1, 0, 5, 1, 1, 0];
+    let args = [2, 1, 1, 0, 0, 1, 1, 0, 11, 0, 1, 0, 17, 1, 0, 0, 5, 1, 1, 0];
     let out_dwords = ((draws + records * draw_stride(expanded)) / 4) as usize;
     let words = run(
         &device,
@@ -221,7 +221,7 @@ fn check(expanded: bool, count: Option<u32>) {
         out_dwords,
     );
     let n = count.unwrap_or(records);
-    let groups = [2, 0, 5].map(|g| g as u64);
+    let groups = [2, 0, 0, 0, 5].map(|g| g as u64);
     let mut used = 0u64;
     let [vb, ib, pb] = layout.bytes(1);
     for i in 0..records as usize {
@@ -266,6 +266,29 @@ fn expanded_records_get_their_own_output() {
 #[test]
 fn records_past_the_count_run_empty() {
     check(false, Some(2));
+}
+
+#[test]
+fn empty_commands_after_a_full_region_bind_valid_addresses() {
+    let Some(device) = device() else { return };
+    let layout = layout(4);
+    let regions = regions(&layout);
+    let base = 0x1_0000_0000;
+    let draws = 2 * COMPUTE_STRIDE;
+    let words = run(
+        &device,
+        &[regions.capacity, 1, 1, 1, 1, 1],
+        (2, 12),
+        None,
+        |_| plan((2, 12, false), &layout, &regions, true, base, draws),
+        ((draws + 2 * draw_stride(true)) / 4) as usize,
+    );
+    assert_eq!(words[6], regions.capacity);
+    assert_eq!(words[16], 0);
+    assert_eq!(&words[10..16], &words[..6]);
+    let d = (draws / 4) as usize;
+    assert_eq!(&words[d + 6..d + 8], &words[d..d + 2]);
+    assert_eq!(words[d + 8], 0);
 }
 
 #[test]
