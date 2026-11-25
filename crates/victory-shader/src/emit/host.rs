@@ -2,6 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -16,6 +17,7 @@ use crate::dxbc::{Container, FourCC};
 pub struct Host {
     pub device: ID3D12Device,
     pub heap_views: u32,
+    warp: bool,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -63,6 +65,94 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// A D3D12 device kept alive for the process so concurrent callers do not
+/// race creating and tearing down the same singleton adapter device.
+struct SharedDevice(ID3D12Device);
+
+// SAFETY: `ID3D12Device` is free-threaded; cloning increments its COM
+// reference count.
+unsafe impl Send for SharedDevice {}
+// SAFETY: as above.
+unsafe impl Sync for SharedDevice {}
+
+fn probe_heap_views(device: &ID3D12Device) -> u32 {
+    // SAFETY: plain D3D12 descriptor heap capability probe.
+    unsafe {
+        if device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: super::HEAP_VIEWS,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .is_ok()
+        {
+            super::HEAP_VIEWS
+        } else {
+            1_000_000
+        }
+    }
+}
+
+fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    unsafe {
+        if std::env::var("VICTORY_D3D12_DEBUG").is_ok_and(|v| v == "1") {
+            let mut layer: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut layer).is_ok()
+                && let Some(layer) = layer
+            {
+                layer.EnableDebugLayer();
+            }
+        }
+        let mut device: Option<ID3D12Device> = None;
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        let adapter: IDXGIAdapter1 = if warp {
+            factory.EnumWarpAdapter().map_err(err)?
+        } else {
+            hardware_adapter(&factory).map_err(err)?
+        };
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        let device = device.ok_or("no device")?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .map_err(err)?;
+        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return Err(format!(
+                "the device supports SM {:#x} only",
+                sm.HighestShaderModel.0
+            ));
+        }
+        Ok(device)
+    }
+}
+
+/// Whether `device` runs on a software adapter (WARP); `true` when that
+/// cannot be told, so its work is serialised rather than raced.
+fn on_software_adapter(device: &ID3D12Device) -> bool {
+    // SAFETY: plain D3D12/DXGI queries with valid pointers.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return true;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return true;
+        };
+        adapter
+            .GetDesc1()
+            .map_or(true, |d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+}
+
 /// The first adapter that is a GPU: not flagged software, and with video
 /// memory of its own. A machine without one (GitHub's Windows runner has only
 /// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
@@ -92,62 +182,56 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
     ))
 }
 
+/// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
+/// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
+static WARP_LOCK: Mutex<()> = Mutex::new(());
+
 impl Host {
+    fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
+        self.warp
+            .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     /// A software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
-        unsafe {
-            if std::env::var("VICTORY_D3D12_DEBUG").is_ok_and(|v| v == "1") {
-                let mut layer: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut layer).is_ok()
-                    && let Some(layer) = layer
-                {
-                    layer.EnableDebugLayer();
-                }
-            }
-            let mut device: Option<ID3D12Device> = None;
-            let factory: IDXGIFactory4 =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let adapter: IDXGIAdapter1 = if warp {
-                factory.EnumWarpAdapter().map_err(err)?
-            } else {
-                hardware_adapter(&factory).map_err(err)?
-            };
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
-            }
-            let heap_views = if device
-                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: super::HEAP_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
+        if warp {
+            static WARP: OnceLock<Result<(SharedDevice, u32), String>> = OnceLock::new();
+            let shared = WARP.get_or_init(|| {
+                let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let device = create_device(true)?;
+                let heap_views = probe_heap_views(&device);
+                Ok((SharedDevice(device), heap_views))
+            });
+            return shared
+                .as_ref()
+                .map(|(d, heap_views)| Host {
+                    device: d.0.clone(),
+                    heap_views: *heap_views,
+                    warp: true,
                 })
-                .is_ok()
-            {
-                super::HEAP_VIEWS
-            } else {
-                1_000_000
-            };
-            Ok(Host { device, heap_views })
+                .map_err(Clone::clone);
+        }
+        let device = create_device(false)?;
+        let heap_views = probe_heap_views(&device);
+        Ok(Host {
+            device,
+            heap_views,
+            warp: false,
+        })
+    }
+
+    /// A host on a device made elsewhere (the GPU crate's). Its work is
+    /// serialised as WARP's is when the device runs on a software adapter.
+    pub fn from_device(device: ID3D12Device) -> Self {
+        let warp = on_software_adapter(&device);
+        let heap_views = probe_heap_views(&device);
+        Host {
+            device,
+            heap_views,
+            warp,
         }
     }
 
@@ -329,18 +413,26 @@ impl Host {
             },
         };
         // SAFETY: the description points at live arrays.
-        unsafe {
+        let blob: ID3DBlob = unsafe {
             let mut blob = None;
             let mut error = None;
             D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
                 .map_err(err)?;
-            let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
-            let bytes = std::slice::from_raw_parts(
-                blob.GetBufferPointer().cast::<u8>(),
-                blob.GetBufferSize(),
-            );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
-        }
+            blob.ok_or("no root signature blob")?
+        };
+        // SAFETY: `blob` stays alive for the lifetime of `bytes`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        self.root_signature_bytes(bytes)
+    }
+
+    /// Creates a root signature from serialized root signature bytes (or a
+    /// DXIL container carrying one).
+    pub fn root_signature_bytes(&self, bytes: &[u8]) -> Result<ID3D12RootSignature, String> {
+        let _guard = self.lock_warp();
+        // SAFETY: `bytes` is a live slice of root-signature or container bytes.
+        unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -395,6 +487,7 @@ impl Host {
             },
             ..Default::default()
         };
+        let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| {
             let msgs = self.debug_messages();
@@ -504,6 +597,7 @@ impl Host {
             desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
             desc.DepthStencilState.StencilEnable = true.into();
         }
+        let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
         let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
         pso.map_err(err)
@@ -614,6 +708,7 @@ impl Host {
             SizeInBytes: size_of::<Stream>(),
             pPipelineStateSubobjectStream: (&raw mut stream).cast(),
         };
+        let _guard = self.lock_warp();
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
@@ -628,6 +723,8 @@ impl Host {
     pub fn fuses_fmad(&self) -> Result<bool, String> {
         let shader = fmad_probe().map_err(|e| e.to_string())?;
         let (root, pso) = self.compute_pipeline(&shader)?;
+        // Taken after the pipeline, which takes it itself.
+        let _guard = self.lock_warp();
         let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
         let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
@@ -983,6 +1080,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        let _guard = self.lock_warp();
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1423,6 +1521,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -2039,5 +2138,56 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    /// Regression test for concurrent WARP device creation, pipeline
+    /// compilation, and draws across threads (issue #181).
+    #[test]
+    fn parallel_warp_pipelines_and_draws() {
+        let Ok(first) = Host::new(true) else {
+            eprintln!("no SM 6.6 warp device; skipped");
+            return;
+        };
+        let second = Host::new(true).expect("second WARP Host::new");
+        assert_eq!(first.device, second.device, "WARP device should be shared");
+
+        let ps = stub_ps();
+        let vs = stub_vs(&ps).expect("stub_vs");
+        let threads = 8;
+        let barrier = Barrier::new(threads);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..4 {
+                        let host = Host::new(true).expect("WARP Host::new");
+                        let (root, pso) = host.pipeline(&vs, &ps).expect("WARP pipeline");
+                        let out = host
+                            .draw(
+                                &root,
+                                &pso,
+                                &Draw {
+                                    roots: Vec::new(),
+                                    textures: &[],
+                                    samplers: &[],
+                                    vertices: &[],
+                                    stride: 0,
+                                    size: (4, 4),
+                                    mesh_groups: 0,
+                                },
+                            )
+                            .expect("WARP draw");
+                        assert_eq!(out.len(), 16);
+                    }
+                });
+            }
+        });
     }
 }

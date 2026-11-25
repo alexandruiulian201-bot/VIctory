@@ -293,11 +293,7 @@ fn create() -> windows::core::Result<Host> {
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
-        match (victory_shader::emit::host::Host {
-            device: device.clone(),
-            heap_views,
-        })
-        .fuses_fmad()
+        match victory_shader::emit::host::Host::from_device(device.clone()).fuses_fmad()
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
@@ -3500,6 +3496,10 @@ struct SwapChainRetry {
 }
 
 impl SwapChainRetry {
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
     /// A desktop can become presentable again. Keep retrying while limiting
     /// the DXGI calls and warnings during the outage.
     fn attempt<T, E>(
@@ -3507,7 +3507,7 @@ impl SwapChainRetry {
         now: Instant,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Option<Result<T, E>> {
-        if self.next_attempt.is_some_and(|next| now < next) {
+        if !self.ready(now) {
             return None;
         }
         let result = operation();
@@ -3532,8 +3532,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    report_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -3546,8 +3545,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            report_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -3562,10 +3560,7 @@ impl Meter {
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.report_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -3587,14 +3582,12 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
-        let root_views = crate::draw::take_root_view_slots() as f64 / frames;
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let report_frames = std::mem::take(&mut self.report_frames) as f64;
+            let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            let indirect = crate::list::take_indirect() as f64 / report_frames;
+            let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -3614,8 +3607,8 @@ impl Meter {
                 saved as f64 / 1e6,
                 heap_used as f64 / 1e6,
                 heap_free as f64 / 1e6,
-                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
-                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
+                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
+                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -3639,24 +3632,25 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                // Window caption updates leave the report counters intact.
+                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
-                log_gpu_times(copy_frames);
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
+                log_gpu_times(report_frames);
+                crate::copystat::log(report_frames);
+                crate::bindless::log(report_frames);
+                crate::shadow::log_views(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
                         "texture read backs: {:.1}/frame, {:.1} KB/frame",
-                        n as f64 / frames,
-                        bytes as f64 / frames / 1e3
+                        n as f64 / report_frames,
+                        bytes as f64 / report_frames / 1e3
                     );
                 }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        *n as f64 / report_frames
                     );
                 }
             }
@@ -3748,7 +3742,13 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
-        self.present_with_compositor(planes, frame, Compositor::new)
+        self.present_with_compositor(
+            planes,
+            frame,
+            Compositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
     }
 
     fn present_with_compositor(
@@ -3756,6 +3756,10 @@ impl Host {
         planes: &[(&ID3D12Resource, u32)],
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
+            &ID3D12Resource,
+            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        ),
     ) -> Option<bool> {
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
@@ -3775,10 +3779,37 @@ impl Host {
             width = width.min(cap_w);
             height = height.min(cap_h);
         }
-        let use_compositor =
+        let wants_compositor =
             planes.len() > 1 || (width, height) != (primary_desc.Width as u32, primary_desc.Height);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
+        if presenter.is_none() && !retry.ready(Instant::now()) {
+            return None;
+        }
+        let cached_format = presenter
+            .as_ref()
+            .and_then(|p| p.compositor.as_ref())
+            .map(|c| c.format);
+        let mut new_compositor = None;
+        let (planes, use_compositor) = if wants_compositor && cached_format != Some(format) {
+            match create_compositor(&self.device, format) {
+                Ok(c) => {
+                    new_compositor = Some(c);
+                    (planes, true)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
+                    (&planes[..1], false)
+                }
+            }
+        } else {
+            (planes, wants_compositor)
+        };
+        let (width, height) = if use_compositor {
+            (width, height)
+        } else {
+            (primary_desc.Width as u32, primary_desc.Height)
+        };
         if presenter.is_none() {
             *presenter = match retry
                 .attempt(Instant::now(), || self.presenter(width, height, format))?
@@ -3791,6 +3822,9 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if let Some(c) = new_compositor {
+            p.compositor = Some(c);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
@@ -3812,21 +3846,6 @@ impl Host {
                 }
             }
         }
-        // Leave the copy list closed if compositor initialization fails.
-        let compositor = if use_compositor {
-            if p.compositor.as_ref().is_none_or(|c| c.format != format) {
-                match create_compositor(&self.device, format) {
-                    Ok(c) => p.compositor = Some(c),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "no present compositor");
-                        return None;
-                    }
-                }
-            }
-            Some(p.compositor.as_ref()?)
-        } else {
-            None
-        };
         // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -3849,7 +3868,23 @@ impl Host {
                 ));
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
-                #[cfg(feature = "diagnostics")]
+                #[cfg(all(test, feature = "diagnostics"))]
+                let capture = {
+                    // Inspect what reached the swap chain, before Present.
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let readback = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    readback
+                };
+                #[cfg(all(not(test), feature = "diagnostics"))]
                 let capture = crate::capture::wanted(frame)
                     .then(|| crate::capture::read_back(&self.device, list, texture))
                     .flatten();
@@ -3872,7 +3907,10 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = compositor.expect("compositor was created for multiple planes");
+                let comp = p
+                    .compositor
+                    .as_ref()
+                    .expect("compositor was prepared for multi-plane or scaled present");
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3892,6 +3930,7 @@ impl Host {
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
                 let count = planes.len().min(MAX_PLANES as usize);
                 let mut before = Vec::with_capacity(count + 1);
+                let mut after = Vec::with_capacity(count);
                 for (i, &(tex, state)) in planes[..count].iter().enumerate() {
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or_else(|| {
@@ -3918,11 +3957,20 @@ impl Host {
                         handle,
                     );
                     let state = D3D12_RESOURCE_STATES(state as i32);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                        && planes[..i]
+                            .iter()
+                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                    {
                         before.push(transition(
                             tex,
                             state,
                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                        after.push(transition(
+                            tex,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            state,
                         ));
                     }
                 }
@@ -3967,7 +4015,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
-                    let capture = crate::capture::wanted(frame)
+                    let capture = (cfg!(test) || crate::capture::wanted(frame))
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
@@ -3988,17 +4036,6 @@ impl Host {
                     )]);
                     (None::<()>, None::<()>)
                 };
-                let mut after = Vec::with_capacity(count);
-                for &(tex, state) in &planes[..count] {
-                    let state = D3D12_RESOURCE_STATES(state as i32);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
-                        after.push(transition(
-                            tex,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                            state,
-                        ));
-                    }
-                }
                 if !after.is_empty() {
                     list.ResourceBarrier(&after);
                 }
@@ -4008,6 +4045,10 @@ impl Host {
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
+                // Tests inspect the completed copy before flip-discard Present
+                // can invalidate the back buffer, with the presenter still locked.
+                #[cfg(test)]
+                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -4727,7 +4768,7 @@ mod present_plane_tests {
     use super::*;
 
     #[test]
-    fn compositor_failure_preserves_single_plane_presentation() {
+    fn compositor_failure_presents_primary_in_the_same_frame() {
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
@@ -4770,7 +4811,7 @@ mod present_plane_tests {
             }
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(32, 32, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4778,21 +4819,60 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 1).is_some(),
             "single-plane control"
         );
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy has completed. The footprint names
+                // a live RGBA pixel inside the readback buffer.
+                let rgba = unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
+
         let mut attempted = false;
-        assert!(
-            host.present_with_compositor(&[(&scene, state), (&overlay, state)], 2, |_, _| {
+        let mut fallback = None;
+        let shown = host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            2,
+            |_, _| {
                 attempted = true;
                 Err(windows::core::Error::from_hresult(
                     windows::Win32::Foundation::E_FAIL,
                 ))
-            })
-            .is_none(),
-            "injected compositor failure"
+            },
+            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
         );
         assert!(attempted);
         assert!(
-            host.present(&[(&scene, state)], 3).is_some(),
-            "single-plane presentation after compositor initialization failed"
+            shown.is_some(),
+            "the primary plane must still be shown in this frame"
         );
+        assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
+        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_chain = presentation.presenter.as_ref().unwrap();
+        assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+        drop(presentation);
+
+        let mut composite = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&overlay, state)],
+                3,
+                Compositor::new,
+                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some(),
+            "compositor initialization can be retried after failure"
+        );
+        // Premultiplied half-blue over opaque red.
+        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
