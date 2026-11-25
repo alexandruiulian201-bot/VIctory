@@ -251,6 +251,7 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) bounded_srvs: bool,
 }
 
 impl Stage {
@@ -394,6 +395,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                bounded_srvs: false,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -468,6 +470,35 @@ impl HostPipeline {
             let mut cs_samplers = Vec::new();
             let (ms_shader, ms_vis) = &stages[0];
             bound.push(add_stage(ms_shader, *ms_vis, &mut cs_params, &mut cs_samplers)?);
+            // This mesh stage already requires a view heap. A descriptor
+            // table can bound raw reads to the backing title allocation,
+            // whereas a root SRV contains only a GPU virtual address.
+            let ms = &mut bound[0];
+            ms.bounded_srvs = ms.translated().used.iter().any(|u| {
+                u.root == victory_shader::RootType::Table && u.kind != victory_shader::ResourceType::Sampler
+            });
+            let ranges: Vec<_> = ms.root_srvs.iter().map(|&(slot, _)| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                BaseShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            }).collect();
+            if ms.bounded_srvs {
+                for (&(_, param), range) in ms.root_srvs.iter().zip(&ranges) {
+                    cs_params[param as usize] = D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                NumDescriptorRanges: 1,
+                                pDescriptorRanges: range,
+                            },
+                        },
+                        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    };
+                }
+            }
             let out_first = cs_params.len() as u32;
             for register in 0..3 {
                 cs_params.push(D3D12_ROOT_PARAMETER1 {

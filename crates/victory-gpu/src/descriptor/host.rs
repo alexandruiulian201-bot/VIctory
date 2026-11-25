@@ -344,6 +344,35 @@ impl HostHeap {
         };
     }
 
+    /// Install a raw SRV over the backed dwords of a title root view.
+    pub(crate) fn raw_at(&self, index: u32, shadow: &crate::shadow::Shadow, address: u64) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let offset = shadow.offset(address);
+        let words = shadow.left(address).min(1 << 30) / 4;
+        if !offset.is_multiple_of(4) || words == 0 {
+            return None;
+        }
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: words as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: the leased slot belongs to this shader-visible heap.
+        unsafe {
+            host()?.device.CreateShaderResourceView(&shadow.buffer, Some(&desc), self.cpu(index));
+            let mut gpu = self.heap.GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += u64::from(index) * u64::from(self.step);
+            Some(gpu)
+        }
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,

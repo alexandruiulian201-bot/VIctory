@@ -1100,7 +1100,8 @@ impl<'a> Lower<'a> {
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
-            s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            title_lds_dwords = ms.lds_bytes.div_ceil(4);
+            s.lds_dwords = title_lds_dwords;
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
@@ -3239,16 +3240,19 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let limit = self.title_lds_dwords;
+        // RDNA2 LDS out-of-bounds accesses read 0 and drop writes/atomics;
+        // guard every TGSM access with `index < title_lds_dwords` so host GPUs
+        // never trap on OOB shared-memory accesses or touch the wave64 scratchpad.
+        let lds_index = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
-            let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            let lim = l.s.m.i32(limit);
+            let in_bounds = l.s.m.cmp(c, pred::IULT, index, lim);
+            (index, in_bounds)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -3275,11 +3279,20 @@ impl<'a> Lower<'a> {
                 return Err("an LDS read of bytes or halves");
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
+            let z = self.s.m.i32(0);
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (index, in_bounds) = lds_index(self, off + 4 * k);
+                    let cond = match guard {
+                        Some(g) => Some(self.s.m.bin(self.cur, Bin::And, g, in_bounds)),
+                        None => Some(in_bounds),
+                    };
+                    let at = self.begin_guarded(cond);
+                    let lds = self.s.lds();
+                    let p = self.s.m.element(self.cur, lds, index);
                     let x = self.s.m.load(self.cur, p);
+                    let x = self.end_guarded(at, &[(x, z)])[0];
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -3306,8 +3319,12 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (index, in_bounds) = lds_index(self, off);
+                let g_in = self.begin_guarded(Some(in_bounds));
+                let lds = self.s.lds();
+                let p = self.s.m.element(self.cur, lds, index);
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(g_in, &[]);
             }
             self.end_guarded(at, &[]);
             if self.sync_lds {
@@ -3345,8 +3362,14 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        let (index, in_bounds) = lds_index(self, offset);
+        let cond = match guard {
+            Some(g) => Some(self.s.m.bin(self.cur, Bin::And, g, in_bounds)),
+            None => Some(in_bounds),
+        };
+        let at = self.begin_guarded(cond);
+        let lds = self.s.lds();
+        let p = self.s.m.element(self.cur, lds, index);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.

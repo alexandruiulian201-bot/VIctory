@@ -561,8 +561,23 @@ impl State {
                     let Some(Root::View(address)) = self.roots_ref(roots).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        if srv && stage.bounded_srvs { return false; }
                         continue;
                     };
+                    if srv && stage.bounded_srvs {
+                        let address = *address;
+                        let key = self.heaps[0];
+                        if key == 0 || address == 0 { return false; }
+                        let Some(heap) = crate::descriptor::heap(key as This).host() else { return false };
+                        let Some(shadow) = crate::shadow::find(address, 1) else { return false };
+                        let Some(index) = self.take_dynamic(heap, key, 1) else { return false };
+                        let Some(view) = heap.raw_at(index, &shadow, address) else { return false };
+                        shadow.refresh(list, address, shadow.left(address).min(1 << 20));
+                        // SAFETY: the mesh compute signature has a single SRV
+                        // range here. Refresh and the lease keep it live.
+                        unsafe { l.SetComputeRootDescriptorTable(param, view) };
+                        continue;
+                    }
                     let Some(gpu) = root_view(list, *address, srv) else {
                         continue;
                     };
