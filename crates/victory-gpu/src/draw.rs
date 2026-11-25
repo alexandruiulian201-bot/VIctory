@@ -74,6 +74,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Bounded raw SRV descriptors created for mesh fallback root SRVs in this
+    /// list: `(title view heap key, title GPU address) → host GPU descriptor handle`.
+    bounded_srvs: std::collections::HashMap<(usize, u64), D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The dynamic slots the list holds (title heap, first, count), given
     /// back when the list is reset or released, or earlier when a heap runs
     /// short after the list ran (see [`crate::descriptor::lease`]).
@@ -567,11 +570,27 @@ impl State {
                     if srv && stage.bounded_srvs {
                         let address = *address;
                         let key = self.heaps[0];
-                        if key == 0 || address == 0 { return false; }
-                        let Some(heap) = crate::descriptor::heap(key as This).host() else { return false };
-                        let Some(shadow) = crate::shadow::find(address, 1) else { return false };
-                        let Some(index) = self.take_dynamic(heap, key, 1) else { return false };
-                        let Some(view) = heap.raw_at(index, &shadow, address) else { return false };
+                        if key == 0 || address == 0 {
+                            return false;
+                        }
+                        let Some(shadow) = crate::shadow::find(address, 1) else {
+                            return false;
+                        };
+                        let view = if let Some(&cached) = self.bounded_srvs.get(&(key, address)) {
+                            cached
+                        } else {
+                            let Some(heap) = crate::descriptor::heap(key as This).host() else {
+                                return false;
+                            };
+                            let Some(index) = self.take_dynamic(heap, key, 1) else {
+                                return false;
+                            };
+                            let Some(view) = heap.raw_at(index, &shadow, address) else {
+                                return false;
+                            };
+                            self.bounded_srvs.insert((key, address), view);
+                            view
+                        };
                         shadow.refresh(list, address, shadow.left(address).min(1 << 20));
                         // SAFETY: the mesh compute signature has a single SRV
                         // range here. Refresh and the lease keep it live.
